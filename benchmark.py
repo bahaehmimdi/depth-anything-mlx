@@ -46,23 +46,38 @@ def main() -> None:
     parser.add_argument("--python", default=sys.executable, help="interpreter with real torch + transformers + mlx installed")
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument(
+        "--all", action="store_true",
+        help="run all three: torch-mlx, real PyTorch CPU, real PyTorch MPS -- instead of --real-torch-device's single choice",
+    )
     parser.add_argument("--real-torch-device", default="cpu", choices=["cpu", "mps"])
     args = parser.parse_args()
 
+    runs = []
     print("Running torch-mlx backend...")
-    mlx_result = _run(args.python, "torch-mlx", args.iters, args.warmup)
+    runs.append(("torch-mlx", _run(args.python, "torch-mlx", args.iters, args.warmup)))
 
-    print(f"Running real-torch backend (device={args.real_torch_device})...")
-    torch_result = _run(args.python, "real-torch", args.iters, args.warmup, args.real_torch_device)
+    if args.all:
+        for device in ("cpu", "mps"):
+            print(f"Running real-torch backend (device={device})...")
+            runs.append((f"real PyTorch ({device})", _run(args.python, "real-torch", args.iters, args.warmup, device)))
+    else:
+        print(f"Running real-torch backend (device={args.real_torch_device})...")
+        runs.append((
+            f"real PyTorch ({args.real_torch_device})",
+            _run(args.python, "real-torch", args.iters, args.warmup, args.real_torch_device),
+        ))
 
-    _summarize("torch-mlx (this repo)", mlx_result)
-    _summarize(f"real PyTorch ({args.real_torch_device})", torch_result)
+    for label, result in runs:
+        _summarize(label, result)
 
-    mlx_median = statistics.median(mlx_result["times_s"])
-    torch_median = statistics.median(torch_result["times_s"])
-    ratio = torch_median / mlx_median
-    faster = "torch-mlx" if ratio > 1 else f"real PyTorch ({args.real_torch_device})"
-    print(f"\n{faster} is {max(ratio, 1 / ratio):.2f}x faster (median forward-pass time)")
+    medians = {label: statistics.median(result["times_s"]) for label, result in runs}
+    fastest_label = min(medians, key=medians.get)
+    print(f"\n{'label':<22}{'median ms':>12}{'vs fastest':>14}")
+    for label, median in sorted(medians.items(), key=lambda kv: kv[1]):
+        ratio = median / medians[fastest_label]
+        print(f"{label:<22}{median * 1000:>12.1f}{ratio:>13.2f}x")
+    print(f"\nFastest: {fastest_label}")
 
 
 if __name__ == "__main__":
