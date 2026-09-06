@@ -270,3 +270,51 @@ briefly suggested (that run's own PyTorch-MPS baseline jumped to
 measurement in this file — a real anomaly in that specific run, most
 likely thermal/system noise after many consecutive heavy benchmarks,
 not a real result, and not used here).
+
+## Profiling before rewriting further (torch-mlx Round 404)
+
+Before attempting a bigger rewrite of `interpolate()` itself (a sparse/
+windowed gather `Function` with its own backward pass, replacing the
+dense matmul entirely), profiled where large-image time actually goes
+post-Round-403. Two findings changed the plan:
+
+1. `F.interpolate` itself was already fast (~77ms at 9000×12000) — the
+   bigger rewrite would have shaved a already-small number, not fixed
+   a real bottleneck. **Not attempted**, correctly, once measured.
+2. Most of what looked like "resize" time in earlier profiling was
+   actually PIL's own `pil_to_tensor` image-to-array conversion
+   (~200ms for a 9000×12000 image) — confirmed **identical** under
+   real, unmodified PyTorch + real torchvision (0.200s vs torch-mlx's
+   0.205s). Not a torch-mlx cost at all; nothing to fix here.
+
+What profiling *did* point to: Round 403's box-prereduction ran its
+halving stages as `k` sequential `reshape`+`mean` calls, each
+materializing a full intermediate array. Round 404 fuses this into ONE
+`reshape`+`mean` over a factor of `2^k` — mathematically identical
+(mean-of-means over equal-sized groups equals one flat mean over their
+union; confirmed bit-identical, not just close), just fewer dispatches.
+
+```
+Round 403 (iterative halving):  1422.5ms
+Round 404 (fused reduction):    1360.8ms   (~4.3% further improvement)
+```
+
+**Cumulative improvement across today's four fixes**, same 108MP case,
+same machine, clean same-process measurements throughout:
+
+```
+Before any of today's fixes:  ~1616-2115ms (varied by measurement)
+Round 401 (correctness only): antialiased downsampling didn't work at all before this
+Round 402 (weight-matrix cache):     -> ~1469ms
+Round 403 (box pre-reduction):       -> ~1422ms
+Round 404 (fused reduction):         -> ~1361ms
+```
+
+The remaining gap to real PyTorch's MPS backend (~750ms, flat
+regardless of image size) is now split between: (a) the fixed
+model-forward cost neither backend can avoid, (b) the PIL conversion
+cost both backends pay equally, and (c) torch-mlx's own model forward
+pass being somewhat slower than PyTorch's MPS kernels for this specific
+architecture at this point — not further resize/preprocessing
+inefficiency, which has now been profiled down to the point of
+diminishing returns.
