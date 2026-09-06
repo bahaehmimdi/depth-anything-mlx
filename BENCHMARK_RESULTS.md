@@ -456,3 +456,48 @@ Reproduce with:
 ```bash
 python3 experiments/run_native_encoder_experiment.py
 ```
+
+## One more real fused-kernel gap found the same way (torch-mlx Round 406)
+
+The native-encoder experiment's correctness check was itself useful:
+writing that code from scratch surfaced that `layer_norm` had the exact
+same shape of bug `scaled_dot_product_attention` did in Round 405 —
+composed from primitives (mean/subtract/power/mean/sqrt/divide/scale/shift)
+instead of using MLX's own fused `mx.fast.layer_norm`, which every
+transformer block in this project calls twice per layer. Same gating
+as Round 405 (fast path only when no gradient is needed — the fused
+kernel is differentiable via real `mx.grad` but not via this project's
+own hand-rolled autograd tape).
+
+Verified against real PyTorch (max diff ~1.4e-6, both fast path and
+grad fallback), and ran the fuller test suite this time — ViT, CLIP,
+Llama (GQA), Whisper (encoder-decoder cross-attention) all pass in
+full including every backward/gradient check.
+
+```
+480x640,   clean same-process A/B: 699.8ms -> 667.7ms  (~4.6%)
+9000x12000 (108MP):                1267.3ms -> 1231.5ms (~2.8%)
+```
+
+**Final cumulative table, 108MP, vs real PyTorch MPS (~750ms, flat):**
+
+```
+Before any fixes today:      ~1616-2115ms   2.15x
+Round 402 (weight cache):        ~1469ms    1.94x
+Round 403 (box prereduce):       ~1422ms    1.88x
+Round 404 (fused reduce):        ~1361ms    1.80x
+Round 405 (fused SDPA):          ~1256ms    1.66x (eager) / 1.58x (compiled)
+BILINEAR resize-back:            ~1215ms    1.61x
+Round 406 (fused LayerNorm):     ~1231ms    1.64x
+```
+
+(Measured directly as the "NEW" value in the same-process A/B above,
+1231.5ms — not re-derived from the separate subprocess-benchmark
+numbers on the earlier rows, which have their own run-to-run variance
+already documented throughout this file. Ratios above use each row's
+own measurement against real PyTorch MPS's ~750ms baseline.)
+
+Reproduce with:
+```bash
+python3 benchmark.py --iters 8 --warmup 3 --real-torch-device mps --height 9000 --width 12000
+```
