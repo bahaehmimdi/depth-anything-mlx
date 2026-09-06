@@ -8,6 +8,58 @@ running during these runs.
 
 **Hardware**: Apple M1 Pro, 32GB unified memory.
 
+## Complete findings log (read this first)
+
+Everything tested across this project's optimization pass, shipped and
+ruled-out alike — a full accounting, not just the wins. Detailed
+write-ups for each are in the sections below and in torch-mlx's own
+commit history (Rounds 401-406).
+
+**Shipped, verified fixes:**
+
+| # | Fix | Where | Result |
+|---|---|---|---|
+| 1 | Antialiased downsampling for `F.interpolate` (didn't work at all before) | torch-mlx Round 401 | Correctness fix — real photos (>518px, i.e. almost all of them) crashed before this |
+| 2 | Cache `_interp_weight_matrix` (pure function of shapes, rebuilt every call) | torch-mlx Round 402 | Up to 132ms/call saved on repeated same-shape calls |
+| 3 | Box-filter pre-reduction for ≥8x downsample ratios | torch-mlx Round 403 | 2.6x on the resize step alone at 12MP+ |
+| 4 | Fuse the pre-reduction's sequential halvings into one op | torch-mlx Round 404 | ~33% further on top of #3 |
+| 5 | Use `mx.fast.scaled_dot_product_attention` (was hand-composed) | torch-mlx Round 405 | **Biggest single win**: ~8.1% end-to-end at 480×640 |
+| 6 | Use `mx.fast.layer_norm` (was hand-composed) | torch-mlx Round 406 | ~4.6% end-to-end at 480×640, found via the native-encoder experiment |
+| 7 | BILINEAR instead of PIL's default BICUBIC for the depth-map resize-back | depth-anything-mlx (own code, not torch-mlx) | ~4.4% at 108MP, less variance |
+
+All seven verified against real PyTorch (floating-point precision for
+the torch-mlx fixes) and/or a real end-to-end `estimate()` call (no
+NaNs, correct shapes, at both small and 108MP scale). Rounds 405/406
+also passed torch-mlx's own test suite in full (ViT, CLIP, Llama/GQA,
+Whisper, including every backward/gradient check) to confirm no
+regression to the differentiable fallback paths they're gated behind.
+
+**Tested and correctly ruled out** (each for a specific, verified
+reason — not assumed, not skipped):
+
+| Idea | Result | Why |
+|---|---|---|
+| `mx.compile` on the model forward | ~2-6%, and 0% at 108MP | Matmul/attention-dominated, not much for kernel fusion to buy — independently confirmed on a different model (`ltx2-compile-experiment`) |
+| Full native `mx.array` DINOv2 encoder (no torch-mlx at all) | 1.01x — no real difference | Proves the shim's Python overhead was never the bottleneck; built and verified correct first, then benchmarked |
+| Full fp16 model | 0.86x — **slower** | fp16↔fp32 casting overhead at `mx.fast.*` kernel boundaries (which compute internally in fp32 regardless of input dtype) cancels the raw matmul win |
+| Selective fp16 (MLP only, rest fp32) | 0.99x — no real difference | Isolated MLP module IS 1.32x faster in fp16, but the same boundary-casting cost shows up once integrated end to end; accuracy was fine (1.1% of final pixels shift by 1/255), speed just doesn't materialize |
+| 8-bit / 4-bit weight quantization | 1.01x / 0.96x — no benefit | Quantization is a memory-bandwidth win; this workload (~1800 tokens processed at once) is compute-bound, not bandwidth-bound |
+| Fused QKV projection (3 matmuls → 1) | 0.95x — no benefit | MLX's per-kernel dispatch overhead is already low enough that this classic (CUDA-world) optimization doesn't apply |
+| NHWC-only layout (avoid per-conv NCHW↔NHWC transpose round-trips) | 1.02x — no benefit | MLX's lazy evaluation already treats these transposes as cheap views, not forced copies |
+| `np.asarray` instead of `np.array(..., copy=True)` in `pil_to_tensor` | Real 26% time difference, but **not applied** | The copy is intentional (documented: prevents a mutated tensor from corrupting the PIL image's own buffer) — this is a safety feature, not a bug |
+| Patchify via matmul instead of `conv2d` for the patch embedding | Real 1.71x, but not shipped | The op runs once per image; absolute savings (~0.8ms) is <0.15% of total — not worth the added code for that |
+| Custom hand-written Metal kernel (fused residual-add + layer-scale) | Real 1.29x, correctness verified, but not shipped | Op is cheap and called 48 times total; ~5.5ms total savings on a ~650-700ms pipeline, and integrating it means monkey-patching HuggingFace's own modeling code, not torch-mlx |
+| Video-specific ideas (batching, temporal caching, async streams, persistent pipeline, realtime/offline split) | Don't apply | This project processes single images, not video |
+| MLX-native end-to-end preprocessing (bypass HF's `AutoImageProcessor`) | Not attempted | Bigger architectural change; the actual measured preprocessing cost (PIL's `pil_to_tensor`) is identical under real PyTorch too, so it wouldn't change the relative comparison |
+
+**Net result**: at normal photo sizes (≤~12MP — the vast majority of
+real use), torch-mlx now runs this model **faster than real PyTorch's
+own MPS backend**. At extreme sizes (48MP+), it's ~1.6x behind, for a
+cause traced all the way down to Apple's own `mlx.core` GEMM kernel
+throughput vs its own `torch` MPS GEMM kernel throughput — a gap
+between two Apple-authored compute libraries, not reachable from
+`torch-mlx` or `depth-anything-mlx`.
+
 ```
 $ python3 benchmark.py --iters 15 --warmup 3 --all
 
