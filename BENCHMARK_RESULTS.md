@@ -33,6 +33,7 @@ anyway — zero risk, may help other torch-mlx workloads):
 | Fix | Where | Isolated result | End-to-end result |
 |---|---|---|---|
 | `mx.addmm` fusion for `F.linear`'s matmul+bias, per [awni/mlx-skills](https://github.com/awni/mlx-skills)'s fast-mlx guide | torch-mlx Round 407 | Real, verified: 1.01-1.07x per call depending on shape (bit-identical output, forward and backward) | **No measurable difference** — same-process A/B, 677.8ms vs 678.6ms, within noise. GEMM compute time at this model's shapes (1224 tokens/call) dominates so completely that saving one kernel-dispatch per linear call doesn't surface above the noise floor. Kept shipped anyway since it's a correctness-neutral internal change to torch-mlx's own `F.linear` (no monkey-patching, no integration cost) that could help other workloads with different linear shapes (e.g. batch-1 decoding, closer to where this technique is normally recommended) |
+| Weak-typed Python scalars in `Tensor` arithmetic (`x * 2.0` no longer force-upcasts), per the same guide's type-promotion pitfall | torch-mlx Round 408 | **Real correctness fix, not just perf**: `Tensor._wrap`'s eager `Tensor(other)` on a bare Python scalar was a genuine divergence from real PyTorch — confirmed both ways against a real install that `fp16_tensor * 2.0` stays fp16 in PyTorch but was silently upcasting to fp32 in torch-mlx, for every scalar arithmetic op project-wide (`+`,`-`,`*`,`/`,`//`,`%`, both directions). Fixed via a new `_wrap_weak` used only by the dunders that route straight into `Function.apply` (which already passes non-`Tensor` args through untouched) — deliberately not a blanket change to `_wrap` itself, since ~60 other call sites in `_tensor.py` need a real `Tensor` back. Verified bit-identical to real PyTorch across fp32/fp16/bfloat16, forward and backward; full test suite (11 pytest + ViT/CLIP/Llama-GQA/Whisper, all gradient checks) still passes. | **No measurable difference** on this model either — interleaved A/B (4 rounds alternating old/new within fp16 mode), 513.1ms vs 518.2ms mean-of-medians, new if anything slightly slower, within noise. Makes sense: the call sites this fixes (GELU's scalar constants, etc.) are cheap elementwise ops dwarfed by the big matmuls/fused-attention calls that dominate total time. Kept shipped as a correctness fix independent of this model's lack of measurable benefit — a real semantic bug affecting any torch-mlx user relying on scalar arithmetic to preserve dtype |
 
 All seven verified against real PyTorch (floating-point precision for
 the torch-mlx fixes) and/or a real end-to-end `estimate()` call (no
@@ -48,8 +49,8 @@ reason — not assumed, not skipped):
 |---|---|---|
 | `mx.compile` on the model forward | ~2-6%, and 0% at 108MP | Matmul/attention-dominated, not much for kernel fusion to buy — independently confirmed on a different model (`ltx2-compile-experiment`) |
 | Full native `mx.array` DINOv2 encoder (no torch-mlx at all) | 1.01x — no real difference | Proves the shim's Python overhead was never the bottleneck; built and verified correct first, then benchmarked |
-| Full fp16 model | 0.86x — **slower** | fp16↔fp32 casting overhead at `mx.fast.*` kernel boundaries (which compute internally in fp32 regardless of input dtype) cancels the raw matmul win |
-| Selective fp16 (MLP only, rest fp32) | 0.99x — no real difference | Isolated MLP module IS 1.32x faster in fp16, but the same boundary-casting cost shows up once integrated end to end; accuracy was fine (1.1% of final pixels shift by 1/255), speed just doesn't materialize |
+| ~~Full fp16 model: 0.86x, slower~~ — **superseded, see below** | See "fp16 revisited" section | That number predates Rounds 405/406 (fused `mx.fast.*` attention/layer_norm); re-measured after those landed, fp16 is now genuinely ~1.35x **faster**. Left struck through rather than deleted — a real measurement at the time, just of a since-changed codebase, not a wrong one |
+| Selective fp16 (MLP only, rest fp32) | 0.99x — no real difference (at the time) | Isolated MLP module IS 1.32x faster in fp16, but the same boundary-casting cost showed up once integrated end to end at the time this was measured; not re-tested post-405/406, may also be stale now for the same reason as the row above |
 | 8-bit / 4-bit weight quantization | 1.01x / 0.96x — no benefit | Quantization is a memory-bandwidth win; this workload (~1800 tokens processed at once) is compute-bound, not bandwidth-bound |
 | Fused QKV projection (3 matmuls → 1) | 0.95x — no benefit | MLX's per-kernel dispatch overhead is already low enough that this classic (CUDA-world) optimization doesn't apply |
 | NHWC-only layout (avoid per-conv NCHW↔NHWC transpose round-trips) | 1.02x — no benefit | MLX's lazy evaluation already treats these transposes as cheap views, not forced copies |
@@ -478,6 +479,43 @@ At normal photo sizes (≤~12MP), torch-mlx is now **faster** than real
 PyTorch's own MPS backend (see the crossover table earlier in this
 file) — the gap above is specific to sizes most real photos never
 reach.
+
+## fp16 revisited: the "0.86x, slower" finding is now stale
+
+The original full-fp16 test (recorded as 0.86x — slower, in the
+ruled-out table above) was, as best can be reconstructed, run before
+Rounds 405/406 existed (fused `mx.fast.scaled_dot_product_attention`/
+`mx.fast.layer_norm`). Investigating the Round 408 type-promotion fix
+(above) prompted re-measuring fp16 against the *current* codebase,
+since Round 405/406 changed how much of the model's per-layer compute
+even goes through composed, Python-level arithmetic at all (the fused
+kernels take one dtype-preserving path per call instead of many small
+ops) — and the result reverses the old finding entirely:
+
+```
+fp32 mean-of-medians: 753.6 ms
+fp16 mean-of-medians: 558.4 ms
+ratio: 1.350x -- fp16 is now FASTER, not slower
+```
+
+(3 interleaved fp32/fp16 pairs, 480×640, same process, `estimate()`'s
+underlying model forward — full A/B script kept in this write-up's
+history, not checked in as a repo file since it's a one-off re-measure
+rather than a maintained benchmark path.)
+
+**Correctness, checked rather than assumed given the size of the
+reversal**: torch-mlx's own fp16-vs-fp32 relative difference is
+0.00030; real, unmodified PyTorch's own `model.half()` fp16-vs-fp32
+relative difference on the identical input is 0.00059 — torch-mlx's
+fp16 accuracy is in the same ballpark as real PyTorch's own, not
+uniquely degraded. No NaNs either side.
+
+**Not yet done**: this re-measurement was a one-off script against the
+bare model forward, not a wired-up, documented `dtype=` option on
+`DepthAnythingMLX` (which currently only exposes `compiled=`), and
+wasn't re-checked at 108MP or re-tested for the "selective fp16"
+variant noted as stale above. Whether to build and ship that as a real
+option is a separate decision from this finding.
 
 ## Was the shim itself the problem? Tested, not assumed: no.
 
