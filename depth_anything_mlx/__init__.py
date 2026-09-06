@@ -64,7 +64,21 @@ def _ensure_torch_mlx_active() -> None:
 
 
 class DepthAnythingMLX:
-    def __init__(self, model_id: str = MODEL_ID):
+    def __init__(self, model_id: str = MODEL_ID, compiled: bool = False):
+        """`compiled=True` wraps the forward pass in `mx.compile`, via
+        the pattern from vendor/vision's own `benchmark_torch_mlx.py`:
+        extract every parameter's raw `mx.array` (`Tensor.data`), define
+        a pure function of (params, raw input array) -> raw output array
+        using `torch.func.functional_call` to run the model statelessly,
+        and hand THAT to `mx.compile` -- `torch.compile` itself doesn't
+        exist here (see torch/compiler/__init__.py: real speedups on
+        this project come from `mx.compile` instead). Measured on this
+        model: numerically correct (max abs diff ~3.7e-4 vs eager, only
+        floating-point noise) but only ~1.02x faster -- this is a
+        matmul/attention-dominated transformer, not the kind of long
+        elementwise-op chain `mx.compile`'s kernel fusion mainly helps.
+        Left as an opt-in for completeness and so the number is easy to
+        reproduce, not because it's expected to be a meaningful win."""
         _ensure_torch_mlx_active()
 
         from transformers import AutoImageProcessor, AutoModelForDepthEstimation
@@ -79,6 +93,22 @@ class DepthAnythingMLX:
             model_id, use_safetensors=True, disable_mmap=True
         )
 
+        self.compiled = compiled
+        if compiled:
+            import mlx.core as mx
+            from torch._tensor import Tensor
+            from torch.func import functional_call
+
+            self._raw_params = {n: p.data for n, p in self.model.named_parameters()}
+
+            def _raw_forward(params, raw_pixel_values):
+                p = {k: Tensor(v) for k, v in params.items()}
+                pixel_values = Tensor(raw_pixel_values)
+                out = functional_call(self.model, p, kwargs={"pixel_values": pixel_values})
+                return out.predicted_depth.data
+
+            self._compiled_forward = mx.compile(_raw_forward)
+
     def estimate(self, image):
         """`image`: a PIL.Image (any mode/size). Returns a grayscale
         (mode "L") PIL.Image the same size as the input, min-max
@@ -92,10 +122,18 @@ class DepthAnythingMLX:
 
         image = image.convert("RGB")
         inputs = self.processor(images=image, return_tensors="pt")
-        with torch.no_grad():
-            predicted_depth = self.model(**inputs).predicted_depth[0]
 
-        depth = np.array(predicted_depth.tolist())
+        if self.compiled:
+            import mlx.core as mx
+
+            raw_out = self._compiled_forward(self._raw_params, inputs["pixel_values"].data)
+            mx.eval(raw_out)
+            depth = np.array(raw_out[0].tolist())
+        else:
+            with torch.no_grad():
+                predicted_depth = self.model(**inputs).predicted_depth[0]
+            depth = np.array(predicted_depth.tolist())
+
         depth_min, depth_max = depth.min(), depth.max()
         normalized = (depth - depth_min) / (depth_max - depth_min + 1e-8)
         return Image.fromarray((normalized * 255).astype(np.uint8)).resize(image.size)

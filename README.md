@@ -62,6 +62,18 @@ depth = model.estimate(Image.open("photo.png"))
 depth.save("photo_depth.png")          # grayscale, same size as input
 ```
 
+Pass `compiled=True` to wrap the forward pass in `mx.compile` (via
+`torch.func.functional_call`, since `torch.compile` itself doesn't
+exist in torch-mlx — see BENCHMARK_RESULTS.md for how and how much it
+actually helps: a small, real, consistently-positive ~2-4%, not a
+transformative speedup, since this is a matmul/attention-dominated
+model rather than the long elementwise chains `mx.compile` mainly
+helps):
+
+```python
+model = DepthAnythingMLX(compiled=True)
+```
+
 ## Benchmark
 
 ```bash

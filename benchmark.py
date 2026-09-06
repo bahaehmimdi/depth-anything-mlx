@@ -20,10 +20,12 @@ HERE = Path(__file__).resolve().parent
 WORKER = HERE / "_bench_worker.py"
 
 
-def _run(python_bin: str, backend: str, iters: int, warmup: int, device: str | None = None) -> dict:
+def _run(python_bin: str, backend: str, iters: int, warmup: int, device: str | None = None, compiled: bool = False) -> dict:
     cmd = [python_bin, str(WORKER), "--backend", backend, "--iters", str(iters), "--warmup", str(warmup)]
     if device:
         cmd += ["--device", device]
+    if compiled:
+        cmd += ["--compiled"]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"{backend} benchmark failed:\n{result.stderr[-3000:]}")
@@ -56,6 +58,9 @@ def main() -> None:
     runs = []
     print("Running torch-mlx backend...")
     runs.append(("torch-mlx", _run(args.python, "torch-mlx", args.iters, args.warmup)))
+
+    print("Running torch-mlx backend (mx.compile)...")
+    runs.append(("torch-mlx (compiled)", _run(args.python, "torch-mlx", args.iters, args.warmup, compiled=True)))
 
     if args.all:
         for device in ("cpu", "mps"):

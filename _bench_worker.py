@@ -33,12 +33,12 @@ def _make_test_image():
     return Image.fromarray(arr)
 
 
-def run_torch_mlx(iters: int, warmup: int) -> dict:
+def run_torch_mlx(iters: int, warmup: int, compiled: bool = False) -> dict:
     sys.path.insert(0, str(HERE))
     from depth_anything_mlx import DepthAnythingMLX
 
     t0 = time.time()
-    model = DepthAnythingMLX()
+    model = DepthAnythingMLX(compiled=compiled)
     load_s = time.time() - t0
 
     image = _make_test_image()
@@ -54,7 +54,8 @@ def run_torch_mlx(iters: int, warmup: int) -> dict:
     import mlx.core as mx
 
     device = f"mlx / {mx.default_device()} (Metal)"
-    return {"backend": "torch-mlx", "device": device, "load_s": load_s, "times_s": times}
+    backend = "torch-mlx (compiled)" if compiled else "torch-mlx"
+    return {"backend": backend, "device": device, "load_s": load_s, "times_s": times}
 
 
 def run_real_torch(iters: int, warmup: int, device: str) -> dict:
@@ -92,12 +93,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=["torch-mlx", "real-torch"], required=True)
     parser.add_argument("--device", default="cpu", help="real-torch only: cpu or mps")
+    parser.add_argument("--compiled", action="store_true", help="torch-mlx only: wrap the forward pass in mx.compile")
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
     args = parser.parse_args()
 
     if args.backend == "torch-mlx":
-        result = run_torch_mlx(args.iters, args.warmup)
+        result = run_torch_mlx(args.iters, args.warmup, args.compiled)
     else:
         result = run_real_torch(args.iters, args.warmup, args.device)
 
