@@ -377,3 +377,44 @@ torch-mlx's general per-op dispatch overhead relative to PyTorch's more
 mature MPS kernels for this specific model family — a different, likely
 smaller-yield class of optimization than the "just wasn't using the
 fused kernel" find above.
+
+## A fix in this repo's own code, not torch-mlx (found by profiling stage-by-stage)
+
+Timed `estimate()`'s stages independently (preprocess / backbone / neck
++head / full) at 108MP and found a ~240ms gap between the sum of the
+parts and the actual `estimate()` call — meaning something in
+`estimate()` itself, outside the model, was uncounted. Traced it to the
+final line: `Image.fromarray(...).resize(image.size)`, upscaling the
+tiny 518×691 depth map back to the original 12000×9000 photo's size.
+PIL's `.resize()` default is `BICUBIC`, measured at **212.7ms** for
+this exact upscale — vs `BILINEAR`'s **152.6ms** (~28% cheaper) and
+`NEAREST`'s 46.6ms (cheapest but visibly blocky). Switched the default
+to `BILINEAR`: smooth enough for a low-frequency, already-quantized
+depth map, no need for `BICUBIC`/`LANCZOS`'s sharper photographic
+fidelity here.
+
+Clean same-process A/B, full `estimate()` call, 108MP:
+```
+OLD (BICUBIC):   1270.0ms
+NEW (BILINEAR):  1214.7ms   (~4.4% faster, also noticeably less variance)
+```
+
+This is the first fix in this whole session that's specific to
+depth-anything-mlx's own code, not torch-mlx — a reminder that not
+every remaining gap is the shim's fault.
+
+**Final cumulative table, 108MP, vs real PyTorch MPS (~750ms, flat):**
+
+```
+Before any fixes today:      ~1616-2115ms   2.15x
+Round 402 (weight cache):        ~1469ms    1.94x
+Round 403 (box prereduce):       ~1422ms    1.88x
+Round 404 (fused reduce):        ~1361ms    1.80x
+Round 405 (fused SDPA):          ~1256ms    1.66x (eager) / 1.58x (compiled)
+BILINEAR resize-back:            ~1215ms    1.61x (eager)
+```
+
+At normal photo sizes (≤~12MP), torch-mlx is now **faster** than real
+PyTorch's own MPS backend (see the crossover table earlier in this
+file) — the gap above is specific to sizes most real photos never
+reach.

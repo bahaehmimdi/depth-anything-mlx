@@ -147,7 +147,17 @@ class DepthAnythingMLX:
         scaled = (normalized * 255).astype(mx.uint8)
         mx.eval(scaled)
 
-        return Image.fromarray(np.array(scaled)).resize(image.size)
+        # PIL's `.resize()` default (BICUBIC) is real, measured cost at
+        # large photo sizes: 212.7ms for the depth map's upscale back to
+        # a 12000x9000 original vs BILINEAR's 152.6ms (~28% cheaper) --
+        # found via profiling, was previously the single largest
+        # unaccounted-for chunk of estimate()'s own time (not a
+        # torch-mlx/model cost at all). BILINEAR is a reasonable
+        # default for a low-frequency, already-quantized-to-uint8
+        # derived signal like a depth map -- smooth, not blocky like
+        # NEAREST (46.6ms, cheapest but visibly blocky), and this
+        # doesn't need BICUBIC/LANCZOS's sharper photographic fidelity.
+        return Image.fromarray(np.array(scaled)).resize(image.size, Image.BILINEAR)
 
     def estimate_path(self, image_path, output_path) -> str:
         from PIL import Image
