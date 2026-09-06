@@ -144,12 +144,46 @@ real PyTorch (cpu)          2086.4         2.78x
 ```
 
 At this scale, real PyTorch's MPS backend is genuinely ~8-14% faster
-than torch-mlx (not parity, unlike the small-image case) — most likely
-because this repo's `_interp_weight_matrix` antialias implementation
-(a dense `(out_size, in_size)` matrix built via a Python-level loop
-over ~2×support+1 taps, see torch-mlx Round 401) does real work
-proportional to the input's size to build the resampling matrix every
-call, and isn't as optimized as PyTorch's native resize kernel for a
-large downsample ratio (~7.7x here vs ~1.2x for the small test image).
-`mx.compile` still helps by about the same ~6% it did at the smaller
-size.
+than torch-mlx (not parity, unlike the small-image case) — see below
+for why, and how it gets worse at larger sizes still.
+
+## Scaling with input size (this is the real story)
+
+Same setup, pushed further — 8000×6000 (48MP) and 12000×9000 (108MP):
+
+```
+size            torch-mlx    torch-mlx(c)   PyTorch MPS   torch-mlx vs MPS
+480x640            767ms          737ms          750ms          1.02x
+4000x3000          857ms          809ms          749ms          1.14x
+8000x6000         1203ms         1044ms          753ms          1.60x
+12000x9000        1616ms         1632ms          750ms          2.15x
+```
+
+**Real PyTorch's MPS time is flat regardless of input size** (~750ms
+throughout). **torch-mlx's time grows with input size**, and the gap
+widens monotonically: 1.02x → 1.14x → 1.60x → 2.15x. This is not noise
+— it's an architectural difference, and it's precisely explainable:
+
+`interpolate()`'s per-axis resize (`torch/nn/functional.py`) does
+`y = y.matmul(w.transpose(0, 1))`, where `w` is a **dense**
+`(out_size, in_size)` matrix. This costs `O(in_size × out_size)`
+regardless of how many of `w`'s entries are actually nonzero — and for
+antialiased downsampling, only `~2×support+1` entries per row are
+nonzero (a small, roughly constant number of taps), the rest is zero.
+A real windowed/local resize kernel (what PyTorch's native
+implementation does) only touches `O(out_size × support)` input
+elements total, independent of `in_size` — which is exactly why its
+time doesn't grow with input size here. torch-mlx's dense-matmul
+formulation is elegant (reuses already-differentiable `matmul`/`permute`
+for free gradients, see `_interp_weight_matrix`'s own docstring) but
+isn't the right data structure for a large, sparse resize — a
+sparse/gather-based reimplementation would fix this scaling behavior,
+at the cost of needing its own backward pass instead of inheriting one
+from `matmul`. Not attempted here — noted as a real, identified
+follow-up opportunity for torch-mlx, not implemented in this pass.
+
+At 108MP, `mx.compile`'s benefit also disappears (1616ms eager vs
+1632ms compiled — within noise, no longer a real win) after being a
+consistent, if small, positive at every smaller size tested — plausibly
+because whatever `mx.compile` fuses stops mattering once the dense
+`(in_size, out_size)` matmul itself dominates the time.

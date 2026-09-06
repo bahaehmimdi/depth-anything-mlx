@@ -94,11 +94,14 @@ mean/median/min/max forward-pass timing for both. See
   interior of an image; there's a real, narrow discrepancy in the last
   ~10px near each edge (boundary-clamping details, not the core
   algorithm) — see torch-mlx's Round 401 commit for the exact numbers.
-- At large image sizes (tested at 4000×3000 / 12MP), this repo's
-  antialiased resize is measurably slower than real PyTorch's native
-  kernel — real PyTorch's MPS backend comes out ~8-14% faster overall
-  at that scale, vs. parity at small (480×640) sizes. See
-  BENCHMARK_RESULTS.md's "At realistic photo size" section.
+- torch-mlx's resize scales with input image size (real PyTorch's
+  native kernel doesn't) — the gap widens from parity at 480×640 to
+  ~2.15x slower at 12000×9000 (108MP). Root cause identified precisely:
+  `interpolate()` uses a dense `(out_size, in_size)` matmul for what's
+  actually a sparse/windowed operation. See BENCHMARK_RESULTS.md's
+  "Scaling with input size" section for the full numbers and
+  explanation — a real, identified follow-up opportunity for torch-mlx,
+  not fixed here.
 - Depth-Anything-V2's depth polarity (near-vs-far convention) hasn't
   been cross-checked against any other depth model here — treat
   `estimate()`'s output as Depth-Anything-V2's own scale, not a
