@@ -418,3 +418,41 @@ At normal photo sizes (≤~12MP), torch-mlx is now **faster** than real
 PyTorch's own MPS backend (see the crossover table earlier in this
 file) — the gap above is specific to sizes most real photos never
 reach.
+
+## Was the shim itself the problem? Tested, not assumed: no.
+
+The obvious next hypothesis after the matmul-throughput finding above:
+maybe torch-mlx's own Python-level overhead (`Tensor` wrapper,
+`nn.Module` dispatch machinery) is adding a real, separate tax on top
+of the raw matmul gap — and a full native `mx.array`-only
+reimplementation of the encoder (no torch-mlx at all) would close it.
+
+Built it for real rather than assuming either way — see
+`experiments/native_encoder_experiment.py` (patch embedding, position
+encoding interpolation, all 24 attention+MLP layers via
+`mx.fast.scaled_dot_product_attention`, final layernorm, all direct
+`mx.array`, zero torch-mlx). Verified numerically correct against the
+existing torch-mlx backbone first (max diff ~5e-5 across all 4
+extracted stages — floating-point noise from 24 layers, not a
+discrepancy), then benchmarked:
+
+```
+native encoder (no torch-mlx):  556.3ms
+torch-mlx backbone:              562.0ms
+ratio: 1.01x -- within noise, no real difference
+```
+
+**This is a real, useful negative result, not a shrug.** It proves —
+doesn't just argue — that torch-mlx's shim overhead was never the
+bottleneck. 100% of the remaining gap is in `mlx.core`'s own compute
+kernels vs PyTorch's MPS kernels (the ~20-27% per-matmul gap measured
+earlier), which no amount of Python-level rewriting, shimmed or
+native, can reach. A full rewrite of the DPT neck/head would very
+likely show the same non-result for the same reason and wasn't
+attempted, since this result already answers the question the rewrite
+was meant to test.
+
+Reproduce with:
+```bash
+python3 experiments/run_native_encoder_experiment.py
+```
