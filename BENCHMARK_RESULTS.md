@@ -9,7 +9,7 @@ weights, identical 480×640 random test image, `benchmark.py`'s default
 ## vs real PyTorch, CPU
 
 ```
-torch-mlx (this repo) (device=mlx (unified memory))
+torch-mlx (this repo) (device=mlx / Device(gpu, 0) (Metal))
   model load: 4.7s
   forward pass over 10 iters:
     mean:   772.0 ms
@@ -31,7 +31,7 @@ torch-mlx is 2.74x faster (median forward-pass time)
 ## vs real PyTorch, MPS (Apple GPU — the fair comparison on this hardware)
 
 ```
-torch-mlx (this repo) (device=mlx (unified memory))
+torch-mlx (this repo) (device=mlx / Device(gpu, 0) (Metal))
   model load: 4.5s
   forward pass over 10 iters:
     mean:   809.7 ms
@@ -48,6 +48,33 @@ real PyTorch (mps) (device=mps)
     max:    1686.0 ms
 
 real PyTorch (mps) is 1.00x faster (median forward-pass time)
+```
+
+Confirmed `mlx.core.default_device()` is `Device(gpu, 0)` on this
+machine before trusting the comparison above — this is a genuine
+GPU-vs-GPU run (MLX's own Metal kernels vs PyTorch's MPS Metal
+kernels), not CPU vs GPU. A second run (system otherwise busy with an
+unrelated git clone, hence the higher absolute numbers) reproduces the
+same parity finding at a different absolute speed:
+
+```
+torch-mlx (this repo) (device=mlx / Device(gpu, 0) (Metal))
+  model load: 7.0s
+  forward pass over 10 iters:
+    mean:   1659.1 ms
+    median: 1668.2 ms
+    min:    1517.2 ms
+    max:    1748.2 ms
+
+real PyTorch (mps) (device=mps)
+  model load: 2.2s
+  forward pass over 10 iters:
+    mean:   1758.7 ms
+    median: 1760.4 ms
+    min:    1705.0 ms
+    max:    1805.2 ms
+
+torch-mlx is 1.06x faster (median forward-pass time)
 ```
 
 ## Takeaway

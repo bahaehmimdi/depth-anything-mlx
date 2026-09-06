@@ -51,7 +51,10 @@ def run_torch_mlx(iters: int, warmup: int) -> dict:
         model.estimate(image)
         times.append(time.time() - t0)
 
-    return {"backend": "torch-mlx", "device": "mlx (unified memory)", "load_s": load_s, "times_s": times}
+    import mlx.core as mx
+
+    device = f"mlx / {mx.default_device()} (Metal)"
+    return {"backend": "torch-mlx", "device": device, "load_s": load_s, "times_s": times}
 
 
 def run_real_torch(iters: int, warmup: int, device: str) -> dict:
