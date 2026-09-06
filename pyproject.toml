@@ -1,0 +1,17 @@
+[project]
+name = "depth-anything-mlx"
+version = "0.1.0"
+description = "Depth-Anything-V2 on Apple Silicon via MLX (torch-mlx), no real PyTorch"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.20.0",
+    "transformers>=5.0.0",
+    "pillow",
+    "numpy",
+]
+
+[project.urls]
+Homepage = "https://github.com/bahaehmimdi/depth-anything-mlx"
+"torch-mlx" = "https://github.com/bahaehmimdi/torch-mlx"
+"torchvision fork" = "https://github.com/bahaehmimdi/vision"

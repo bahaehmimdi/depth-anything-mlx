@@ -1,0 +1,6 @@
+[submodule "vendor/torch-mlx"]
+	path = vendor/torch-mlx
+	url = https://github.com/bahaehmimdi/torch-mlx.git
+[submodule "vendor/vision"]
+	path = vendor/vision
+	url = https://github.com/bahaehmimdi/vision.git
