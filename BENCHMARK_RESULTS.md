@@ -100,3 +100,56 @@ Reproduce with:
 ```bash
 python3 benchmark.py --iters 15 --warmup 3 --all
 ```
+
+## At realistic photo size (4000×3000, 12MP)
+
+`DPTImageProcessor` resizes to ~518px regardless of input size, so this
+doesn't change the model's own compute — it stresses **preprocessing**
+(the resize/antialiasing step) instead, which the small 480×640 test
+image above barely exercises (downsample ratio ~1.2x vs ~7.7x here).
+This size also only became possible at all after Round 401 of
+torch-mlx — real photos this large hit torch-mlx's `F.interpolate`
+antialiased-downsampling gap before that (see "Known limitations").
+
+```
+$ python3 benchmark.py --iters 10 --warmup 3 --all --height 3000 --width 4000
+
+torch-mlx (device=mlx / Device(gpu, 0) (Metal))
+  model load: 4.8s
+  forward pass over 10 iters:
+    mean:   858.9 ms
+    median: 856.6 ms
+
+torch-mlx (compiled) (device=mlx / Device(gpu, 0) (Metal))
+  model load: 5.2s
+  forward pass over 10 iters:
+    mean:   804.8 ms
+    median: 809.3 ms
+
+real PyTorch (cpu) (device=cpu)
+  forward pass over 10 iters:
+    mean:   2089.1 ms
+    median: 2086.4 ms
+
+real PyTorch (mps) (device=mps)
+  forward pass over 10 iters:
+    mean:   749.9 ms
+    median: 749.3 ms
+
+label                    median ms    vs fastest
+real PyTorch (mps)           749.3         1.00x
+torch-mlx (compiled)         809.3         1.08x
+torch-mlx                    856.6         1.14x
+real PyTorch (cpu)          2086.4         2.78x
+```
+
+At this scale, real PyTorch's MPS backend is genuinely ~8-14% faster
+than torch-mlx (not parity, unlike the small-image case) — most likely
+because this repo's `_interp_weight_matrix` antialias implementation
+(a dense `(out_size, in_size)` matrix built via a Python-level loop
+over ~2×support+1 taps, see torch-mlx Round 401) does real work
+proportional to the input's size to build the resampling matrix every
+call, and isn't as optimized as PyTorch's native resize kernel for a
+large downsample ratio (~7.7x here vs ~1.2x for the small test image).
+`mx.compile` still helps by about the same ~6% it did at the smaller
+size.

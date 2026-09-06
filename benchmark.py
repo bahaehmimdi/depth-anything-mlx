@@ -20,8 +20,9 @@ HERE = Path(__file__).resolve().parent
 WORKER = HERE / "_bench_worker.py"
 
 
-def _run(python_bin: str, backend: str, iters: int, warmup: int, device: str | None = None, compiled: bool = False) -> dict:
-    cmd = [python_bin, str(WORKER), "--backend", backend, "--iters", str(iters), "--warmup", str(warmup)]
+def _run(python_bin: str, backend: str, iters: int, warmup: int, device: str | None = None, compiled: bool = False, image_size: tuple[int, int] = (480, 640)) -> dict:
+    cmd = [python_bin, str(WORKER), "--backend", backend, "--iters", str(iters), "--warmup", str(warmup),
+           "--height", str(image_size[0]), "--width", str(image_size[1])]
     if device:
         cmd += ["--device", device]
     if compiled:
@@ -53,24 +54,27 @@ def main() -> None:
         help="run all three: torch-mlx, real PyTorch CPU, real PyTorch MPS -- instead of --real-torch-device's single choice",
     )
     parser.add_argument("--real-torch-device", default="cpu", choices=["cpu", "mps"])
+    parser.add_argument("--height", type=int, default=480, help="test image height (note: DPTImageProcessor resizes to ~518px regardless, so this mainly stresses preprocessing/resize cost, not model compute)")
+    parser.add_argument("--width", type=int, default=640)
     args = parser.parse_args()
+    size = (args.height, args.width)
 
     runs = []
-    print("Running torch-mlx backend...")
-    runs.append(("torch-mlx", _run(args.python, "torch-mlx", args.iters, args.warmup)))
+    print(f"Running torch-mlx backend (image {size[1]}x{size[0]})...")
+    runs.append(("torch-mlx", _run(args.python, "torch-mlx", args.iters, args.warmup, image_size=size)))
 
     print("Running torch-mlx backend (mx.compile)...")
-    runs.append(("torch-mlx (compiled)", _run(args.python, "torch-mlx", args.iters, args.warmup, compiled=True)))
+    runs.append(("torch-mlx (compiled)", _run(args.python, "torch-mlx", args.iters, args.warmup, compiled=True, image_size=size)))
 
     if args.all:
         for device in ("cpu", "mps"):
             print(f"Running real-torch backend (device={device})...")
-            runs.append((f"real PyTorch ({device})", _run(args.python, "real-torch", args.iters, args.warmup, device)))
+            runs.append((f"real PyTorch ({device})", _run(args.python, "real-torch", args.iters, args.warmup, device, image_size=size)))
     else:
         print(f"Running real-torch backend (device={args.real_torch_device})...")
         runs.append((
             f"real PyTorch ({args.real_torch_device})",
-            _run(args.python, "real-torch", args.iters, args.warmup, args.real_torch_device),
+            _run(args.python, "real-torch", args.iters, args.warmup, args.real_torch_device, image_size=size),
         ))
 
     for label, result in runs:

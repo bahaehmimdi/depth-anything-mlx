@@ -24,16 +24,16 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 
-def _make_test_image():
+def _make_test_image(height: int = 480, width: int = 640):
     from PIL import Image
     import numpy as np
 
     rng = np.random.default_rng(0)
-    arr = (rng.random((480, 640, 3)) * 255).astype("uint8")
+    arr = (rng.random((height, width, 3)) * 255).astype("uint8")
     return Image.fromarray(arr)
 
 
-def run_torch_mlx(iters: int, warmup: int, compiled: bool = False) -> dict:
+def run_torch_mlx(iters: int, warmup: int, compiled: bool = False, image_size: tuple[int, int] = (480, 640)) -> dict:
     sys.path.insert(0, str(HERE))
     from depth_anything_mlx import DepthAnythingMLX
 
@@ -41,7 +41,7 @@ def run_torch_mlx(iters: int, warmup: int, compiled: bool = False) -> dict:
     model = DepthAnythingMLX(compiled=compiled)
     load_s = time.time() - t0
 
-    image = _make_test_image()
+    image = _make_test_image(*image_size)
     for _ in range(warmup):
         model.estimate(image)
 
@@ -58,7 +58,7 @@ def run_torch_mlx(iters: int, warmup: int, compiled: bool = False) -> dict:
     return {"backend": backend, "device": device, "load_s": load_s, "times_s": times}
 
 
-def run_real_torch(iters: int, warmup: int, device: str) -> dict:
+def run_real_torch(iters: int, warmup: int, device: str, image_size: tuple[int, int] = (480, 640)) -> dict:
     import torch
     from transformers import AutoImageProcessor, AutoModelForDepthEstimation
     from depth_anything_mlx import MODEL_ID
@@ -68,7 +68,7 @@ def run_real_torch(iters: int, warmup: int, device: str) -> dict:
     model = AutoModelForDepthEstimation.from_pretrained(MODEL_ID).to(device).eval()
     load_s = time.time() - t0
 
-    image = _make_test_image()
+    image = _make_test_image(*image_size)
     inputs = processor(images=image, return_tensors="pt").to(device)
 
     def _step():
@@ -96,12 +96,15 @@ def main() -> None:
     parser.add_argument("--compiled", action="store_true", help="torch-mlx only: wrap the forward pass in mx.compile")
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=640)
     args = parser.parse_args()
 
+    size = (args.height, args.width)
     if args.backend == "torch-mlx":
-        result = run_torch_mlx(args.iters, args.warmup, args.compiled)
+        result = run_torch_mlx(args.iters, args.warmup, args.compiled, size)
     else:
-        result = run_real_torch(args.iters, args.warmup, args.device)
+        result = run_real_torch(args.iters, args.warmup, args.device, size)
 
     print(json.dumps(result))
 
