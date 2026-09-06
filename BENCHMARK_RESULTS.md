@@ -317,4 +317,63 @@ cost both backends pay equally, and (c) torch-mlx's own model forward
 pass being somewhat slower than PyTorch's MPS kernels for this specific
 architecture at this point — not further resize/preprocessing
 inefficiency, which has now been profiled down to the point of
-diminishing returns.
+diminishing returns. Item (c) turned out to have real headroom too —
+see below.
+
+## The actual biggest lever: attention itself (torch-mlx Round 405)
+
+Told to keep digging into (c) above. Split model-forward time by
+component instead of assuming: the DINOv2-Large backbone (24 attention
+layers) is **~82% of total model-forward time** (617ms of 753ms at
+480×640); the DPT neck/head (convolutional feature fusion) is only 18%.
+
+Checked what `scaled_dot_product_attention` actually does in torch-mlx:
+composed from primitives (`matmul` → `softmax` → `matmul`), correct,
+but never used MLX's own fused Metal attention kernel
+(`mx.fast.scaled_dot_product_attention`), which exists for exactly this
+op. Added a fast path (torch-mlx Round 405) that uses it whenever no
+gradient is needed (this project's autograd is a hand-rolled tape, not
+`mx.grad`, so the fused kernel can't be slotted in unconditionally
+without writing a new manual backward formula — gated behind
+`is_grad_enabled()` + `requires_grad` checks instead; the existing
+composed, differentiable path is unchanged and still used whenever
+gradients are actually needed).
+
+Verified against real PyTorch: fast path matches to floating-point
+precision (max diff ~7e-7, both plain and causal attention); the
+gradient fallback path independently verified unaffected (forward *and*
+`q.grad` still match real PyTorch to the same precision).
+
+**This was the single biggest improvement found in this entire session**
+— bigger than all four preprocessing-side fixes combined:
+
+```
+480x640, clean same-process A/B, full estimate() call:
+  OLD (composed attention):     767.5ms
+  NEW (fused mx.fast attention): 705.0ms   (~8.1% faster)
+
+9000x12000 (108MP):
+  Before Round 405:  1360.8ms
+  After Round 405:   1272.1ms   (~6.5% further improvement)
+```
+
+**Cumulative progress across all five fixes, 108MP, vs real PyTorch MPS
+(~755ms, flat regardless of size):**
+
+```
+                          median      vs PyTorch MPS
+Before any fixes today:  ~1616-2115ms      2.15x
+Round 402 (weight cache):    ~1469ms       1.94x
+Round 403 (box prereduce):   ~1422ms       1.88x
+Round 404 (fused reduce):    ~1361ms       1.80x
+Round 405 (fused SDPA):      ~1256ms       1.66x (eager) / 1.58x (compiled)
+```
+
+Gap narrowed from 2.15x to 1.58-1.66x — real, verified, cumulative
+progress, not a single silver bullet. The remaining gap is now
+concentrated in the DINOv2 backbone's non-attention operations
+(LayerNorm, MLP/GELU, the QKV/output linear projections themselves) and
+torch-mlx's general per-op dispatch overhead relative to PyTorch's more
+mature MPS kernels for this specific model family — a different, likely
+smaller-yield class of optimization than the "just wasn't using the
+fused kernel" find above.

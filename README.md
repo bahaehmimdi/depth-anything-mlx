@@ -87,6 +87,14 @@ this project involved), each in its own subprocess, and reports
 mean/median/min/max forward-pass timing for both. See
 [`BENCHMARK_RESULTS.md`](./BENCHMARK_RESULTS.md) for a recorded run.
 
+**Five torch-mlx fixes came directly out of profiling this repo**
+(Rounds 401-405 — antialiased downsampling, weight-matrix caching,
+box-filter pre-reduction for large ratios, fusing that into one op, and
+— the biggest single win — using MLX's own fused attention kernel
+instead of a hand-composed one). Net result at 108MP: the gap to real
+PyTorch's MPS backend narrowed from 2.15x to 1.58-1.66x. Full numbers
+and methodology in BENCHMARK_RESULTS.md.
+
 ## Known limitations
 
 - `F.interpolate(..., antialias=True)` for actual downsampling (torch-mlx
