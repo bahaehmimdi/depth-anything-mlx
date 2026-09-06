@@ -220,3 +220,53 @@ above). The gap still widens with input size — because the fixes
 targeted the *construction* cost, not the *dense-matmul-against-live-data*
 cost, which is the item marked "No" above and remains the actual
 bottleneck at scale.
+
+## Closing the remaining gap: torch-mlx Round 403
+
+The "No — identified, not fixed" item above (dense `O(in_size × out_size)`
+matmul for what's really a sparse/windowed resize) got a real fix:
+box-filter pre-reduction (reshape + mean, the same technique Pillow's
+`Image.reduce()`/mipmapping use) for downsample ratios ≥8x, before
+handing off to the existing exact antialias matmul from the now much
+smaller size. Below 8x, nothing changes — that range was already
+verified floating-point-exact in Round 401.
+
+**This is a genuine accuracy/speed tradeoff above the 8x threshold**,
+measured honestly on both an adversarial and a realistic input:
+
+- Random Gaussian noise, 9000×6000 → 518×345 (~17.4x): mean abs diff
+  **0.018** vs real PyTorch, on a reference std of 0.047 — a large
+  ~38% relative error. White noise is close to worst-case for a box
+  filter vs. a single-pass wide-kernel cubic filter.
+- **A real photo**, 8000×6000 → 518×691 (~15.4x): mean abs diff
+  **0.00089** vs real PyTorch, on a reference std of 0.35 — **~0.25%**
+  relative error. Natural images are dominated by low-frequency content
+  both filters handle similarly — this is the profile any real caller
+  (an image model, this repo's own use case) actually sees, not the
+  noise case above.
+
+**Speed, measured two ways:**
+
+- Resize step in isolation (real photo, 8000×6000 → 518×691): 111.6ms
+  → 42.4ms (**~2.6x**).
+- Full `estimate()` end to end, same-process controlled A/B (toggling
+  the threshold, not a separate subprocess run — subprocess-to-subprocess
+  comparisons at these sizes turned out noisy enough on this machine to
+  be actively misleading, see below):
+
+```
+                        OLD median   NEW median   improvement
+8000x6000  (48MP):        1066ms       1003ms         ~6%
+12000x9000 (108MP):       1469ms       1418ms        ~3.4%
+```
+
+Smaller than the resize-alone number because resize is only one part
+of total cost — the neural network forward pass itself (~750ms,
+constant regardless of image size) dominates even at 108MP. Real,
+modest, honestly-measured — not the resize step's 2.6x, and not the
+"torch-mlx now beats PyTorch at 108MP" result one noisy subprocess run
+briefly suggested (that run's own PyTorch-MPS baseline jumped to
+~1650ms vs. its normal rock-steady ~750ms seen in every other
+measurement in this file — a real anomaly in that specific run, most
+likely thermal/system noise after many consecutive heavy benchmarks,
+not a real result, and not used here).
