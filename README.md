@@ -96,11 +96,13 @@ mean/median/min/max forward-pass timing for both. See
   algorithm) — see torch-mlx's Round 401 commit for the exact numbers.
 - torch-mlx's resize scales with input image size (real PyTorch's
   native kernel doesn't) — the gap widens from parity at 480×640 to
-  ~2.15x slower at 12000×9000 (108MP). Root cause identified precisely:
-  `interpolate()` uses a dense `(out_size, in_size)` matmul for what's
-  actually a sparse/windowed operation. See BENCHMARK_RESULTS.md's
-  "Scaling with input size" section for the full numbers and
-  explanation — a real, identified follow-up opportunity for torch-mlx,
+  ~1.93x slower at 12000×9000 (108MP), after two real fixes made in
+  response to an optimization audit (caching the shape-only weight
+  matrix, keeping normalization in `mx.array` space instead of numpy —
+  see BENCHMARK_RESULTS.md's "Optimization audit" section). The
+  remaining, unfixed root cause: `interpolate()` uses a dense
+  `(out_size, in_size)` matmul for what's actually a sparse/windowed
+  operation — a real, identified follow-up opportunity for torch-mlx,
   not fixed here.
 - Depth-Anything-V2's depth polarity (near-vs-far convention) hasn't
   been cross-checked against any other depth model here — treat

@@ -187,3 +187,36 @@ At 108MP, `mx.compile`'s benefit also disappears (1616ms eager vs
 consistent, if small, positive at every smaller size tested — plausibly
 because whatever `mx.compile` fuses stops mattering once the dense
 `(in_size, out_size)` matmul itself dominates the time.
+
+## Optimization audit (asked directly: was the maximum applied?)
+
+Answer, checked honestly rather than assumed, item by item:
+
+| | Applied? | Notes |
+|---|---|---|
+| Lazy computation | Partially, then fixed | `estimate()` used to force an early `.tolist()` right after the forward pass, then did normalization in numpy — breaking laziness for that whole tail. Now the forward pass and normalization are one lazy graph, evaluated once via a single `mx.eval()` at the very end. |
+| Operation fusion / JIT (`mx.compile`) | Yes, but scoped narrowly | Only wraps the model's own forward pass (`functional_call` + `mx.compile`, see `DepthAnythingMLX.__init__`). It does NOT cover the preprocessing/resize step — which is exactly where the scaling bottleneck below lives. Benefit: 2-6% at small-to-medium sizes, gone at 108MP. |
+| Optimized Metal kernels | Inherent, not something to "apply" further | Every `mx.core` primitive already dispatches to MLX's own Metal kernels. The resize implementation composes many small primitives (`arange`/`clip`/`where`/`.at[].add()`) rather than one specialized fused resize kernel — that's the real gap (see below), not under-use of Metal itself. |
+| Apple Silicon unified memory | Partially, then fixed | Same fix as "lazy computation" above — `.tolist()` + numpy for normalization was an unnecessary CPU round-trip off unified memory for no reason; `np.array(mx_array)` now happens exactly once, after the real work. |
+| Efficient matrix-op handling | **No — identified, not fixed** | `interpolate()`'s per-axis resize does `y.matmul(w.transpose(0,1))` where `w` is a **dense** `(out_size, in_size)` matrix, costing `O(in_size × out_size)` even though only `~2×support+1` entries per row are ever nonzero. This is the real, structural cause of the scaling gap (1.02x → 1.93x from 480×640 to 12000×9000) — a sparse/windowed reimplementation would fix it but wasn't attempted (would need its own backward pass instead of inheriting one from `matmul` for free). |
+| Reusing intermediate computations | Was missing, now fixed | `_interp_weight_matrix` is a pure function of shapes ("depends only on shapes/mode, never on data" — its own docstring already said so) but was rebuilt from scratch every single call. Added `@functools.lru_cache` (torch-mlx Round 402) — a repeated same-shape call now costs ~0ms instead of up to 132ms (measured, one axis, 9000→518). |
+
+**Net effect of the two real fixes made in response to this question**
+(caching + staying in `mx.array` space through normalization), same
+scaling table as above, before → after:
+
+```
+size            before (eager)   after (eager)   before ratio   after ratio
+480x640              767ms            792ms          1.02x          1.10x
+4000x3000            857ms            822ms          1.14x          1.10x
+8000x6000           1203ms           1020ms          1.60x          1.36x
+12000x9000          1616ms           1466ms          2.15x          1.93x
+```
+
+Real, measurable improvement at large sizes (where the fixed
+construction cost was proportionally significant); negligible-to-noisy
+at small sizes (within normal run-to-run variance already documented
+above). The gap still widens with input size — because the fixes
+targeted the *construction* cost, not the *dense-matmul-against-live-data*
+cost, which is the item marked "No" above and remains the actual
+bottleneck at scale.

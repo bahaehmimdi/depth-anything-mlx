@@ -115,8 +115,17 @@ class DepthAnythingMLX:
         normalized to [0, 255] -- larger value = whatever
         Depth-Anything-V2's own `predicted_depth` convention says is
         larger (not cross-checked against any other depth model's
-        polarity convention; treat as Depth-Anything-V2's own scale)."""
-        import torch
+        polarity convention; treat as Depth-Anything-V2's own scale).
+
+        Normalization stays in `mx.array` space (lazy, unified memory,
+        stays on GPU) instead of round-tripping through `.tolist()` +
+        numpy for the min/max/scale arithmetic -- that round-trip
+        previously converted every element to a Python float object and
+        back before doing four elementwise ops on it. `np.array(mx_arr)`
+        converts directly via the array/buffer protocol (no `.tolist()`,
+        no per-element Python objects) exactly once, right at the very
+        end, after the real work is already done."""
+        import mlx.core as mx
         import numpy as np
         from PIL import Image
 
@@ -124,19 +133,21 @@ class DepthAnythingMLX:
         inputs = self.processor(images=image, return_tensors="pt")
 
         if self.compiled:
-            import mlx.core as mx
-
             raw_out = self._compiled_forward(self._raw_params, inputs["pixel_values"].data)
-            mx.eval(raw_out)
-            depth = np.array(raw_out[0].tolist())
+            depth_raw = raw_out[0]
         else:
+            import torch
+
             with torch.no_grad():
                 predicted_depth = self.model(**inputs).predicted_depth[0]
-            depth = np.array(predicted_depth.tolist())
+            depth_raw = predicted_depth.data
 
-        depth_min, depth_max = depth.min(), depth.max()
-        normalized = (depth - depth_min) / (depth_max - depth_min + 1e-8)
-        return Image.fromarray((normalized * 255).astype(np.uint8)).resize(image.size)
+        depth_min, depth_max = mx.min(depth_raw), mx.max(depth_raw)
+        normalized = (depth_raw - depth_min) / (depth_max - depth_min + 1e-8)
+        scaled = (normalized * 255).astype(mx.uint8)
+        mx.eval(scaled)
+
+        return Image.fromarray(np.array(scaled)).resize(image.size)
 
     def estimate_path(self, image_path, output_path) -> str:
         from PIL import Image
