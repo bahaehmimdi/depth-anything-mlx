@@ -27,6 +27,13 @@ commit history (Rounds 401-406).
 | 6 | Use `mx.fast.layer_norm` (was hand-composed) | torch-mlx Round 406 | ~4.6% end-to-end at 480×640, found via the native-encoder experiment |
 | 7 | BILINEAR instead of PIL's default BICUBIC for the depth-map resize-back | depth-anything-mlx (own code, not torch-mlx) | ~4.4% at 108MP, less variance |
 
+**Shipped to torch-mlx, but no measurable effect on this model** (kept
+anyway — zero risk, may help other torch-mlx workloads):
+
+| Fix | Where | Isolated result | End-to-end result |
+|---|---|---|---|
+| `mx.addmm` fusion for `F.linear`'s matmul+bias, per [awni/mlx-skills](https://github.com/awni/mlx-skills)'s fast-mlx guide | torch-mlx Round 407 | Real, verified: 1.01-1.07x per call depending on shape (bit-identical output, forward and backward) | **No measurable difference** — same-process A/B, 677.8ms vs 678.6ms, within noise. GEMM compute time at this model's shapes (1224 tokens/call) dominates so completely that saving one kernel-dispatch per linear call doesn't surface above the noise floor. Kept shipped anyway since it's a correctness-neutral internal change to torch-mlx's own `F.linear` (no monkey-patching, no integration cost) that could help other workloads with different linear shapes (e.g. batch-1 decoding, closer to where this technique is normally recommended) |
+
 All seven verified against real PyTorch (floating-point precision for
 the torch-mlx fixes) and/or a real end-to-end `estimate()` call (no
 NaNs, correct shapes, at both small and 108MP scale). Rounds 405/406
