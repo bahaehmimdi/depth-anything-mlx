@@ -607,6 +607,23 @@ difference from 0.31.2 for this model. No reason to take on the
 upgrade's known risk for an unproven effect. Recommendation: stay on
 0.31.2.
 
+**Independently replicated** on a second occasion (separate venv, same
+methodology, cool-state sanity check passed first): three more
+interleaved rounds gave the tightest data yet --
+
+```
+                fp32                    fp16
+mlx 0.31.2:   1.092, 1.049, 1.049     1.031, 1.032, 1.033
+mlx 0.32.2:   1.048, 1.051, 1.053     1.034, 1.033, 1.034
+```
+
+fp16 is essentially identical between the two MLX versions to within
+0.3%; fp32 clusters tightly around ~1.05x on both with only one mild
+outlier. This confirms the corrected numbers above weren't a one-off --
+same conclusion, even less noise. `mx.compile`'s payoff for this model
+is now well-established: ~1.03x fp16 / ~1.05x fp32, no version-specific
+effect between 0.31.2 and 0.32.2.
+
 **Process note, since this section corrected itself mid-file**:
 absolute-timing benchmarks on this machine are only trustworthy after
 confirming a quick cool-state sanity check first (compare one number
