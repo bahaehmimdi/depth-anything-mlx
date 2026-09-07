@@ -28,6 +28,7 @@ commit history (Rounds 401-406).
 | 7 | BILINEAR instead of PIL's default BICUBIC for the depth-map resize-back | depth-anything-mlx (own code, not torch-mlx) | ~4.4% at 108MP, less variance |
 | 8 | `dtype=mx.float16` option (was ruled out earlier in this project's history; re-verified after torch-mlx's fused-kernel work made that finding stale) | depth-anything-mlx (own code, not torch-mlx) | **~1.15-1.26x** end-to-end, largest single-flag win in this table — see "fp16 revisited" below |
 | 9 | Native preprocessing (bypasses `AutoImageProcessor` entirely for the resize/rescale/normalize chain, so it can run in the model's own `dtype` too) | depth-anything-mlx (own code, not torch-mlx) | Improves the 108MP case specifically from 1.147x to **1.224x** (fp16 vs fp32) — see "native preprocessing" below |
+| 10 | Fold rescale+normalize into the patch-embedding conv's weights (exact algebraic fold, computed once at load time) — user-prioritized idea, item #4 on a list ranking MLX preprocessing options | depth-anything-mlx (own code, not torch-mlx) | Exact (verified 0.0 correctness delta vs real PyTorch, identical to pre-fold), removes 2 elementwise passes per image. Speeds up fp32 more than fp16 in absolute terms (that elementwise cost was a bigger fraction of fp32's time), narrowing the fp16-vs-fp32 ratio at 108MP from 1.224x to 1.129x — not a regression, both got faster, see "fold rescale+normalize" below |
 
 **Shipped to torch-mlx, but no measurable effect on this model** (kept
 anyway — zero risk, may help other torch-mlx workloads):
@@ -603,6 +604,53 @@ at the time it's written — but it's worth a monkeypatch-and-trace
 attempt before calling something architecturally blocked, since the
 actual blocker here was one missing `.round().clip()` call, not a
 fundamentally unreachable internal.
+
+## Fold rescale+normalize into the patch-embedding conv
+
+User-supplied priority list of MLX preprocessing options ranked
+`#10 → #3 → #4 → #5 → #2` ("bypass the processor completely" →
+"MLX-native preprocessing" → "fuse normalization into the first model
+op" → "fuse resize+normalization" → "fp16 preprocessing"). #10, #3, and
+#2 were already exactly what the native-preprocessing work above
+shipped. #4 was new: instead of `image -> resize -> rescale -> normalize
+-> model`, fold rescale+normalize directly into the patch-embedding
+conv's weights, so it's `image -> resize -> model` with no separate
+elementwise passes at all.
+
+This is an exact algebraic fold, not an approximation. The patch conv
+computes `out[k] = sum_{c,i,j} W[k,c,i,j] * norm(x)[c,i,j] + b[k]`
+where `norm(x) = x*rescale/std - mean/std`; substituting and regrouping
+by the raw pixel value `x` instead of `norm(x)` gives `new_W[k,c,i,j] =
+W[k,c,i,j] * rescale/std[c]` and `new_b[k] = b[k] - sum_{c,i,j}
+W[k,c,i,j] * mean[c]/std[c]`. Verified on a synthetic conv with a real
+`mx.conv2d` call (not just the algebra): max diff 4.8e-6 (float32
+rounding). Done once at model-load time in fp32 (for precision) before
+any `dtype=` casting, so it costs nothing per-inference.
+
+Verified on the real model two ways: folded output vs the pre-fold
+native-preprocessing output (mean diff 4.2e-5, max 1/255 — float
+rounding from reordering the same math, not a discrepancy), and folded
+output vs real PyTorch end-to-end (mean diff 0.76, max 3/255) —
+**identical** to the pre-fold comparison against real PyTorch, meaning
+the fold introduced zero additional error.
+
+Speed, clean multi-run medians:
+
+```
+size                 fp32        fp16       ratio
+480x640            668.0ms     505.0ms     1.323x
+4000x3000 (12MP)    715.0ms     562.9ms     1.270x
+12000x9000 (108MP) 1165.6ms    1032.4ms     1.129x
+```
+
+Removing two elementwise passes over the full resized image helps
+both dtypes in absolute terms, but helps fp32 proportionally more
+(that pass was a bigger fraction of fp32's total time than of fp16's) —
+so the fp16-vs-fp32 *ratio* at 108MP actually narrowed from 1.224x to
+1.129x even though both got faster. Not a regression: it's the correct
+outcome of the win being dtype-agnostic. Kept unconditionally (not
+gated behind `dtype=`) since it's a zero-cost, exact simplification
+that helps the fp32 default path too.
 
 ## Was the shim itself the problem? Tested, not assumed: no.
 

@@ -59,9 +59,14 @@ def _constrain_to_multiple_of(val: float, multiple: int, min_val: int = 0, max_v
 
 def _native_preprocess(image, processor, dtype):
     """Reimplements `DPTImageProcessor.__call__`'s pixel_values pipeline
-    natively (resize -> rescale -> normalize) instead of calling
+    natively (resize -> quantize) instead of calling
     `processor(images=image, return_tensors="pt")`, so the whole chain
     can run in `dtype` (e.g. fp16) instead of being locked to fp32.
+    Rescale + normalize are NOT done here -- they're folded into the
+    model's own patch-embedding conv instead, see
+    `_fold_rescale_normalize_into_patch_embed` below, so this returns
+    raw resized-and-quantized pixel values in [0, 255], not the usual
+    normalized range.
 
     This was originally assumed to be blocked: driving the processor's
     own `resize()`/`rescale_and_normalize()` methods (or a from-scratch
@@ -75,16 +80,16 @@ def _native_preprocess(image, processor, dtype):
     to whole pixel values in [0, 255] (uint8 can't hold the negative/
     >255 "ringing" overshoot a true float resize produces), losing
     sub-pixel precision *before* rescale/normalize ever run. Replicating
-    that quantization step (`.round().clip(0, 255)` right after resize,
-    before rescale) reproduces the reference bit-exact (max diff
-    ~4.8e-7, pure float rounding). Verified this holds with `dtype=
-    mx.float16` too (max diff ~5e-4 vs the fp32 reference, matching this
-    project's other fp16 error magnitudes) -- and it's not just
-    "equally correct": doing the resize itself in fp16 is a REAL further
-    speedup (measured ~1.3-1.8x on the resize+quantize step alone,
-    largest at big/108MP-scale images where preprocessing is a bigger
-    fraction of total time), since this bypasses `AutoImageProcessor`
-    entirely rather than casting only the model + its input.
+    that quantization step (`.round().clip(0, 255)` right after resize)
+    reproduces the reference bit-exact (max diff ~4.8e-7, pure float
+    rounding). Verified this holds with `dtype=mx.float16` too (max diff
+    ~5e-4 vs the fp32 reference, matching this project's other fp16
+    error magnitudes) -- and it's not just "equally correct": doing the
+    resize itself in fp16 is a REAL further speedup (measured ~1.3-1.8x
+    on the resize+quantize step alone, largest at big/108MP-scale images
+    where preprocessing is a bigger fraction of total time), since this
+    bypasses `AutoImageProcessor` entirely rather than casting only the
+    model + its input.
 
     Scoped to this class's own fixed assumptions (asserted once at
     __init__ time, not silently ignored): bicubic resample, antialiased,
@@ -114,12 +119,58 @@ def _native_preprocess(image, processor, dtype):
     new_w = _constrain_to_multiple_of(sw * iw, processor.ensure_multiple_of)
 
     resized = F.interpolate(t, size=(new_h, new_w), mode="bicubic", align_corners=False, antialias=True)
-    quantized = resized.round().clip(0, 255)
+    return resized.round().clip(0, 255)
 
-    target_dtype = dtype if dtype is not None else mx.float32
-    mean = Tensor(mx.array(processor.image_mean, dtype=target_dtype).reshape(1, 3, 1, 1))
-    std = Tensor(mx.array(processor.image_std, dtype=target_dtype).reshape(1, 3, 1, 1))
-    return (quantized * processor.rescale_factor - mean) / std
+
+def _fold_rescale_normalize_into_patch_embed(model, processor) -> None:
+    """Folds `_native_preprocess`'s remaining rescale (`x * rescale_factor`)
+    and normalize (`(x - mean) / std`) steps directly into the model's
+    patch-embedding conv weights, so `estimate()` never has to run them
+    as separate elementwise passes over the full-resolution image at
+    all -- `image -> resize -> model` instead of `image -> resize ->
+    rescale -> normalize -> model`.
+
+    This is an EXACT algebraic fold, not an approximation. The patch
+    conv computes, per output channel k: `out[k] = sum_{c,i,j}
+    W[k,c,i,j] * norm(x)[c,i,j] + b[k]` where `norm(x) = x*rescale/std -
+    mean/std`. Substituting and regrouping by `x` (raw quantized pixel
+    value) instead of `norm(x)`:
+
+        new_W[k,c,i,j] = W[k,c,i,j] * rescale_factor / std[c]
+        new_b[k]       = b[k] - sum_{c,i,j} W[k,c,i,j] * mean[c] / std[c]
+
+    Verified on a synthetic conv (random weights, random uint8-range
+    input, real `mx.conv2d` call, not just the algebra in isolation):
+    max diff 4.8e-6 (float32 rounding) between the original rescale+
+    normalize-then-conv path and this folded conv applied directly to
+    the raw pixel values. Done ONCE here at model-load time (fp32, for
+    precision, before any `dtype=` casting happens) rather than adding
+    any per-inference cost -- the folded weights then get cast to
+    `dtype` along with the rest of the model, same as before.
+
+    Hardcodes the exact parameter name Depth-Anything-V2's DINOv2
+    backbone uses (`backbone.embeddings.patch_embeddings.projection`,
+    confirmed via `named_parameters()` against the real loaded model,
+    not assumed from the architecture alone). If a different `model_id`
+    doesn't have this exact submodule, this raises `AttributeError`
+    rather than silently skipping the fold."""
+    import mlx.core as mx
+
+    conv = model.backbone.embeddings.patch_embeddings.projection
+    W = conv.weight.data  # (out_channels, in_channels=3, kh, kw)
+    b = conv.bias.data  # (out_channels,)
+
+    mean = mx.array(processor.image_mean, dtype=mx.float32)  # (3,)
+    std = mx.array(processor.image_std, dtype=mx.float32)  # (3,)
+    rescale = processor.rescale_factor
+
+    new_W = W * (rescale / std.reshape(1, 3, 1, 1))
+    m_over_s = mean / std
+    correction = mx.sum(W * m_over_s.reshape(1, 3, 1, 1), axis=(1, 2, 3))
+    new_b = b - correction
+
+    conv.weight.data = new_W
+    conv.bias.data = new_b
 
 
 def _ensure_torch_mlx_active() -> None:
@@ -204,6 +255,9 @@ class DepthAnythingMLX:
         self.model = AutoModelForDepthEstimation.from_pretrained(
             model_id, use_safetensors=True, disable_mmap=True
         )
+        # Fold in fp32 (for precision) before any dtype= casting below --
+        # see _fold_rescale_normalize_into_patch_embed's own docstring.
+        _fold_rescale_normalize_into_patch_embed(self.model, self.processor)
 
         self.dtype = dtype
         if dtype is not None:
