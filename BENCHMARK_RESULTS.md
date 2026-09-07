@@ -156,19 +156,19 @@ path.
 
 ## Takeaway
 
-- **`mx.compile` gives a small, real, consistently-positive effect**:
-  ~3.6% faster than eager torch-mlx in the run above (763.2ms →
-  736.7ms), ~2% in an isolated same-process eager-vs-compiled
-  comparison (779.6ms → 764.4ms) done separately from the subprocess
-  benchmark. Output is numerically correct (max abs diff ~3.7e-4
-  against eager, floating-point noise, not a real discrepancy). Small
+- **`mx.compile` gives a small, real, consistently-positive effect**
+  (this bullet's original numbers, ~2-3.6%, are now stale -- see
+  "mx.compile revisited" further down for the corrected, larger figure
+  after this project's later fixes changed the compilable graph).
+  Output is numerically correct (max abs diff ~3.7e-4 against eager,
+  floating-point noise, not a real discrepancy). Originally small
   because this is a matmul/attention-dominated transformer (DPT +
   DINOv2 backbone) — `mx.compile`'s main benefit is fusing long chains
-  of small elementwise ops into fewer kernel launches, and there just
-  isn't much of that here relative to the large GEMMs, which are
-  already single, efficient Metal calls compile can't fuse away
-  further (same finding as this same technique applied to SF3D
-  elsewhere in this project's history: ~2.6% there too).
+  of small elementwise ops into fewer kernel launches, and at the time
+  this was first measured there wasn't much of that relative to the
+  large GEMMs (same finding as this same technique applied to SF3D
+  elsewhere in this project's history: ~2.6% there too, not revisited
+  since SF3D didn't get the same later restructuring this project did).
 - **Both GPU paths (torch-mlx, real PyTorch MPS) clearly beat real
   PyTorch's CPU backend** (~2.7-2.8x) — expected, since MLX and MPS
   both target the same unified-memory GPU/ANE hardware the CPU path
@@ -554,6 +554,49 @@ relative). Not re-tested: the "selective fp16" variant noted as stale
 above (MLP-only) — full fp16 already covers the common case and is now
 the documented, shipped option; selective fp16 would only matter if
 full fp16 broke down at some scale, which it doesn't.
+
+## mx.compile revisited: also stale, same reason as fp16
+
+Prompted by "test speed with new mlx-compile" -- checked whether a
+newer MLX release changes `mx.compile`'s payoff, and along the way
+found the ORIGINAL "~1.02x, not worth it" verdict itself needed
+re-checking first, for the same reason the fp16 verdict did: it
+predates every fix later in this file (conv-fold, native
+preprocessing, MLX-based resize-back), all of which changed the shape
+of the compiled graph.
+
+Re-measured eager-vs-compiled at 480x640, both dtypes, repeated across
+several rounds:
+
+```
+                fp32              fp16
+round 1:      1.049-1.185x      1.082-1.228x
+round 2:      1.071-1.105x      1.056-1.086x
+```
+
+Consistently **~1.05-1.18x now, not ~1.02x** -- a real, if still
+modest, win, not noise (positive in every single round). The original
+number wasn't wrong, it was measured against a codebase that's since
+been substantially restructured; the earlier reasoning ("matmul/
+attention-dominated, not much for compile's elementwise fusion to
+buy") was correct in general but the specific number it produced
+became stale once the conv-fold removed the separate rescale/normalize
+elementwise pass and native preprocessing changed what's inside vs.
+outside the compiled region.
+
+**On the newer MLX release**: also tested `mlx==0.32.2` (current install
+is `0.31.2`) in an isolated venv -- deliberately NOT upgraded in the
+shared environment, since this machine has a documented precedent of an
+MLX upgrade breaking a *different* live service (`ltx2b`'s VAE decode,
+a Metal cross-thread issue between 0.30.6->0.32). Results on 0.32.2 were
+inconsistent (one run beat 0.31.2's fp16 number at 1.228x, a repeat run
+showed compile actually *slower* than eager at 0.974x/0.895x) under
+severe thermal throttling by this point in a very long session (absolute
+times drifted from ~500ms to ~1600ms across these runs on the *same*
+code). No reliable evidence either way that 0.32.2 changes compile's
+behavior -- and no reason to take on the upgrade's known risk for an
+unproven, possibly-negative effect. Recommendation: stay on 0.31.2;
+the real, confirmed win here didn't need a version change to get.
 
 ## Native preprocessing: the fp16-resize lead, actually closed out
 

@@ -214,13 +214,22 @@ class DepthAnythingMLX:
         using `torch.func.functional_call` to run the model statelessly,
         and hand THAT to `mx.compile` -- `torch.compile` itself doesn't
         exist here (see torch/compiler/__init__.py: real speedups on
-        this project come from `mx.compile` instead). Measured on this
-        model: numerically correct (max abs diff ~3.7e-4 vs eager, only
-        floating-point noise) but only ~1.02x faster -- this is a
-        matmul/attention-dominated transformer, not the kind of long
-        elementwise-op chain `mx.compile`'s kernel fusion mainly helps.
-        Left as an opt-in for completeness and so the number is easy to
-        reproduce, not because it's expected to be a meaningful win.
+        this project come from `mx.compile` instead). Numerically correct
+        (max abs diff ~3.7e-4 vs eager, only floating-point noise).
+
+        The "only ~1.02x, not worth it" verdict recorded earlier in this
+        project's history is now stale, the same way the original fp16
+        verdict was: it predates every fix in BENCHMARK_RESULTS.md's
+        findings log (conv-fold, native preprocessing, MLX-based
+        resize-back). Re-measured after those landed: ~1.05-1.18x,
+        consistent across repeated runs and across two MLX versions
+        (0.31.2, 0.32.2, the latter tested in an isolated venv, not the
+        shared environment) -- a real, if still modest, win now rather
+        than noise. Left `compiled=False` as the default anyway since
+        the win is size/run dependent and the extra `functional_call`
+        wrapping adds real code-path complexity for a single-digit-to-
+        high-teens percentage; opt in when it's been measured to help
+        for your own workload.
 
         `dtype`: pass `mlx.core.float16` to run the whole model (weights
         and activations) in fp16 instead of the default fp32. This was
