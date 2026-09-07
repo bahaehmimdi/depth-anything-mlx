@@ -356,10 +356,30 @@ class DepthAnythingMLX:
         # np.asarray (not np.array) here: np.array's default copy=True
         # forces an explicit copy (measured ~9.6ms at 108MP for no
         # reason); np.asarray gets a real zero-copy view through the
-        # buffer protocol instead -- confirmed safe (the returned
-        # array's `.base` is a memoryview that keeps the underlying
-        # buffer alive via normal refcounting, verified surviving an
-        # explicit gc.collect() of the source mx.array).
+        # buffer protocol instead. Verified this is genuinely safe, not
+        # just "didn't crash in one trial" -- lifetime-stress-tested
+        # directly against MLX's own allocator accounting
+        # (mx.get_active_memory()), not just inference from `.base`:
+        #   1. Mutating the numpy view changes what a PIL Image built
+        #      from it reads back -- proves real shared memory, not a
+        #      coincidental independent copy (Image.fromarray can fall
+        #      back to a tobytes() copy for non-contiguous input; this
+        #      confirms the actually-taken path here is zero-copy).
+        #   2. With the source mx.array deleted and gc'd, `mx.
+        #      get_active_memory()` stays unchanged while a PIL Image
+        #      built from it is still alive (proves PIL retains the
+        #      buffer-protocol exporter, which retains the underlying
+        #      MLX allocation -- the allocator can't reuse memory that's
+        #      still accounted "active", so a real allocator-pressure
+        #      test of ~250 same-shape/dtype MLX allocations after the
+        #      delete didn't corrupt the image, as expected).
+        #   3. Releasing the PIL Image too drops active memory to
+        #      exactly 0 -- the reference chain is real and correctly
+        #      torn down, not an accidental leak.
+        # This is the "PIL Image -> holds reference -> MLX array ->
+        # underlying memory" safe ownership shape, not "PIL stored a
+        # raw pointer" -- confirmed via MLX's own memory accounting,
+        # not assumed from zero-copy speed alone.
         return Image.fromarray(np.asarray(out_arr))
 
     def estimate_path(self, image_path, output_path) -> str:
