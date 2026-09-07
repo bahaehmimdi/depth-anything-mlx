@@ -20,13 +20,15 @@ HERE = Path(__file__).resolve().parent
 WORKER = HERE / "_bench_worker.py"
 
 
-def _run(python_bin: str, backend: str, iters: int, warmup: int, device: str | None = None, compiled: bool = False, image_size: tuple[int, int] = (480, 640)) -> dict:
+def _run(python_bin: str, backend: str, iters: int, warmup: int, device: str | None = None, compiled: bool = False, image_size: tuple[int, int] = (480, 640), dtype: str | None = None) -> dict:
     cmd = [python_bin, str(WORKER), "--backend", backend, "--iters", str(iters), "--warmup", str(warmup),
            "--height", str(image_size[0]), "--width", str(image_size[1])]
     if device:
         cmd += ["--device", device]
     if compiled:
         cmd += ["--compiled"]
+    if dtype:
+        cmd += ["--dtype", dtype]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"{backend} benchmark failed:\n{result.stderr[-3000:]}")
@@ -65,6 +67,9 @@ def main() -> None:
 
     print("Running torch-mlx backend (mx.compile)...")
     runs.append(("torch-mlx (compiled)", _run(args.python, "torch-mlx", args.iters, args.warmup, compiled=True, image_size=size)))
+
+    print("Running torch-mlx backend (fp16)...")
+    runs.append(("torch-mlx (fp16)", _run(args.python, "torch-mlx", args.iters, args.warmup, image_size=size, dtype="fp16")))
 
     if args.all:
         for device in ("cpu", "mps"):

@@ -33,12 +33,17 @@ def _make_test_image(height: int = 480, width: int = 640):
     return Image.fromarray(arr)
 
 
-def run_torch_mlx(iters: int, warmup: int, compiled: bool = False, image_size: tuple[int, int] = (480, 640)) -> dict:
+def run_torch_mlx(iters: int, warmup: int, compiled: bool = False, image_size: tuple[int, int] = (480, 640),
+                   dtype: str | None = None) -> dict:
     sys.path.insert(0, str(HERE))
     from depth_anything_mlx import DepthAnythingMLX
 
+    import mlx.core as mx
+
+    mx_dtype = {"fp16": mx.float16, "float16": mx.float16}.get(dtype) if dtype else None
+
     t0 = time.time()
-    model = DepthAnythingMLX(compiled=compiled)
+    model = DepthAnythingMLX(compiled=compiled, dtype=mx_dtype)
     load_s = time.time() - t0
 
     image = _make_test_image(*image_size)
@@ -51,10 +56,12 @@ def run_torch_mlx(iters: int, warmup: int, compiled: bool = False, image_size: t
         model.estimate(image)
         times.append(time.time() - t0)
 
-    import mlx.core as mx
-
     device = f"mlx / {mx.default_device()} (Metal)"
-    backend = "torch-mlx (compiled)" if compiled else "torch-mlx"
+    backend = "torch-mlx"
+    if compiled:
+        backend += " (compiled)"
+    if mx_dtype is not None:
+        backend += " (fp16)"
     return {"backend": backend, "device": device, "load_s": load_s, "times_s": times}
 
 
@@ -94,6 +101,8 @@ def main() -> None:
     parser.add_argument("--backend", choices=["torch-mlx", "real-torch"], required=True)
     parser.add_argument("--device", default="cpu", help="real-torch only: cpu or mps")
     parser.add_argument("--compiled", action="store_true", help="torch-mlx only: wrap the forward pass in mx.compile")
+    parser.add_argument("--dtype", choices=["fp16"], default=None,
+                         help="torch-mlx only: run the whole model in fp16 instead of fp32")
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--height", type=int, default=480)
@@ -102,7 +111,7 @@ def main() -> None:
 
     size = (args.height, args.width)
     if args.backend == "torch-mlx":
-        result = run_torch_mlx(args.iters, args.warmup, args.compiled, size)
+        result = run_torch_mlx(args.iters, args.warmup, args.compiled, size, args.dtype)
     else:
         result = run_real_torch(args.iters, args.warmup, args.device, size)
 

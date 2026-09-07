@@ -26,6 +26,7 @@ commit history (Rounds 401-406).
 | 5 | Use `mx.fast.scaled_dot_product_attention` (was hand-composed) | torch-mlx Round 405 | **Biggest single win**: ~8.1% end-to-end at 480×640 |
 | 6 | Use `mx.fast.layer_norm` (was hand-composed) | torch-mlx Round 406 | ~4.6% end-to-end at 480×640, found via the native-encoder experiment |
 | 7 | BILINEAR instead of PIL's default BICUBIC for the depth-map resize-back | depth-anything-mlx (own code, not torch-mlx) | ~4.4% at 108MP, less variance |
+| 8 | `dtype=mx.float16` option (was ruled out earlier in this project's history; re-verified after torch-mlx's fused-kernel work made that finding stale) | depth-anything-mlx (own code, not torch-mlx) | **~1.15-1.26x** end-to-end, largest single-flag win in this table — see "fp16 revisited" below |
 
 **Shipped to torch-mlx, but no measurable effect on this model** (kept
 anyway — zero risk, may help other torch-mlx workloads):
@@ -510,12 +511,29 @@ relative difference on the identical input is 0.00059 — torch-mlx's
 fp16 accuracy is in the same ballpark as real PyTorch's own, not
 uniquely degraded. No NaNs either side.
 
-**Not yet done**: this re-measurement was a one-off script against the
-bare model forward, not a wired-up, documented `dtype=` option on
-`DepthAnythingMLX` (which currently only exposes `compiled=`), and
-wasn't re-checked at 108MP or re-tested for the "selective fp16"
-variant noted as stale above. Whether to build and ship that as a real
-option is a separate decision from this finding.
+**Now shipped**: `DepthAnythingMLX(dtype=mx.float16)`. Re-verified
+through the real `estimate()` end-to-end path (not just the bare model
+forward) at three sizes, `compiled=True` combined cleanly (0 diff vs
+fp16 alone), and correctness re-checked on the final 0-255 depth-map
+image itself, not just the raw model output:
+
+```
+size            fp32       fp16       ratio
+480x640         637.9ms    505.3ms    1.263x
+4000x3000       722.0ms    577.0ms    1.251x
+12000x9000     1257.9ms   1096.4ms    1.147x
+```
+
+Smaller ratio at 108MP because preprocessing (PIL/numpy conversion,
+antialiased resize) stays fp32 regardless of `dtype=` and takes up a
+larger fraction of total time at that scale, diluting the model-forward
+speedup. Correctness: mean abs pixel diff 0.041 (max 1) vs fp32 on the
+final 0-255 image at 480x640 — imperceptible, and in the same ballpark
+as real PyTorch's own fp16-vs-fp32 diff (previously measured at 0.06%
+relative). Not re-tested: the "selective fp16" variant noted as stale
+above (MLP-only) — full fp16 already covers the common case and is now
+the documented, shipped option; selective fp16 would only matter if
+full fp16 broke down at some scale, which it doesn't.
 
 ## Was the shim itself the problem? Tested, not assumed: no.
 

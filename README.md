@@ -74,6 +74,20 @@ helps):
 model = DepthAnythingMLX(compiled=True)
 ```
 
+Pass `dtype=mx.float16` to run the whole model in fp16 instead of the
+default fp32 — a real, verified **~1.15-1.26x** faster (varies with
+image size; see BENCHMARK_RESULTS.md's "fp16 revisited" section),
+correct to the same precision ballpark as real PyTorch's own fp16
+(mean pixel diff ~0.04 on the final 0-255 depth map, imperceptible).
+This was ruled out earlier in this project's history — that finding is
+stale, from before torch-mlx's fused attention/layer-norm kernels
+existed:
+
+```python
+import mlx.core as mx
+model = DepthAnythingMLX(dtype=mx.float16)
+```
+
 ## Benchmark
 
 ```bash

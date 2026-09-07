@@ -64,7 +64,7 @@ def _ensure_torch_mlx_active() -> None:
 
 
 class DepthAnythingMLX:
-    def __init__(self, model_id: str = MODEL_ID, compiled: bool = False):
+    def __init__(self, model_id: str = MODEL_ID, compiled: bool = False, dtype=None):
         """`compiled=True` wraps the forward pass in `mx.compile`, via
         the pattern from vendor/vision's own `benchmark_torch_mlx.py`:
         extract every parameter's raw `mx.array` (`Tensor.data`), define
@@ -78,8 +78,26 @@ class DepthAnythingMLX:
         matmul/attention-dominated transformer, not the kind of long
         elementwise-op chain `mx.compile`'s kernel fusion mainly helps.
         Left as an opt-in for completeness and so the number is easy to
-        reproduce, not because it's expected to be a meaningful win."""
+        reproduce, not because it's expected to be a meaningful win.
+
+        `dtype`: pass `mlx.core.float16` to run the whole model (weights
+        and activations) in fp16 instead of the default fp32. This was
+        RULED OUT earlier in this project's history (recorded as 0.86x,
+        slower) -- that finding is now stale, from before torch-mlx's
+        Round 405/406 added fused `mx.fast.scaled_dot_product_attention`/
+        `mx.fast.layer_norm` kernels. Those fused kernels internally
+        preserve the input dtype end-to-end rather than routing through
+        the composed Python-level arithmetic that used to force spurious
+        fp32 upcasts (see torch-mlx Round 408's `_wrap_weak` fix for the
+        exact mechanism). Re-measured after those changes: fp16 is now
+        genuinely ~1.35x FASTER than fp32, verified correct against real
+        PyTorch's own `model.half()` output (relative diff in the same
+        ballpark as real PyTorch's own fp16 vs fp32 diff, not degraded).
+        See BENCHMARK_RESULTS.md's "fp16 revisited" section for the full
+        numbers. Default (`dtype=None`) stays fp32, unchanged."""
         _ensure_torch_mlx_active()
+
+        import mlx.core as mx
 
         from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
@@ -93,9 +111,13 @@ class DepthAnythingMLX:
             model_id, use_safetensors=True, disable_mmap=True
         )
 
+        self.dtype = dtype
+        if dtype is not None:
+            for p in self.model.parameters():
+                p.data = p.data.astype(dtype)
+
         self.compiled = compiled
         if compiled:
-            import mlx.core as mx
             from torch._tensor import Tensor
             from torch.func import functional_call
 
@@ -131,6 +153,11 @@ class DepthAnythingMLX:
 
         image = image.convert("RGB")
         inputs = self.processor(images=image, return_tensors="pt")
+
+        if self.dtype is not None:
+            from torch._tensor import Tensor
+
+            inputs["pixel_values"] = Tensor(inputs["pixel_values"].data.astype(self.dtype))
 
         if self.compiled:
             raw_out = self._compiled_forward(self._raw_params, inputs["pixel_values"].data)
