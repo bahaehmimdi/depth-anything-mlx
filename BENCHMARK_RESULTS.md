@@ -692,17 +692,67 @@ pulling ahead with size" finding.
 
 The 108MP case is the one place MPS still wins, and the gap has
 narrowed from 2.15x to 1.28x — real, substantial progress, not fully
-closed. The remaining gap is exactly the item marked "identified, not
-fixed" in the optimization audit above: `F.interpolate`'s per-axis
-resize is a dense `(out_size, in_size)` matmul, `O(in_size × out_size)`
-regardless of how sparse the true windowed-resize kernel actually is,
-and MPS's own resize doesn't pay that cost. The box-prereduction fix
-(Round 403) blunted this for ≥8x downsample ratios but didn't replace
-the fundamental data structure; a true sparse/windowed reimplementation
-of antialiased resize remains the identified-but-not-attempted fix for
-closing this specific remaining gap (needs its own backward pass
-instead of inheriting one from `matmul` for free -- the same tradeoff
-noted when Round 403 was scoped).
+closed. The remaining gap was, until this section, marked "identified,
+not fixed": `F.interpolate`'s per-axis resize is a dense `(out_size,
+in_size)` matmul, `O(in_size × out_size)` regardless of how sparse the
+true windowed-resize kernel actually is, and MPS's own resize doesn't
+pay that cost.
+
+## Actually attempted the sparse/windowed fix -- it's slower, not faster
+
+Since this is inference-only (`depth_anything_mlx` never needs a
+backward pass through resize), the usual objection to a sparse
+rewrite -- "needs its own hand-derived backward instead of inheriting
+one from `matmul`" -- doesn't apply here. Built and measured it for
+real rather than leaving it as a theoretical fix:
+
+1. **Pure windowed resize** (no box-prereduction), separable, via a
+   Python loop of `mx.take` gathers (one per tap, `O(out_size × taps)`
+   FLOPs as the complexity analysis predicts): **276ms** at 108MP, fp16
+   -- ~8x *slower* than the current 34-65ms. Each tap is a separate
+   MLX-dispatched gather over the full array; `2×n_taps+1` (73 at this
+   scale) small dispatches costs more in overhead than the dense matmul
+   saves in FLOPs.
+2. **Windowed + box-prereduction** (shrink the ratio to <8x first, then
+   windowed on the smaller size, cutting taps from 73 to ~17): **55-90ms**
+   -- still not competitive.
+3. **Single fused Metal kernel** (`mx.fast.metal_kernel`, one GPU thread
+   per output pixel, reading only its own `~9-73`-tap local window
+   directly -- no per-tap dispatch overhead, matching the "custom
+   Metal kernel" approach in the priority list this was built from):
+   **47-250ms** across runs, still consistently slower than the current
+   approach in every controlled, interleaved A/B (4 rounds: kernel
+   137-259ms vs current 35-75ms, kernel always worse).
+
+Correctness was verified first and is genuinely excellent (mean
+relative error ~0.3% against real PyTorch — confirmed with an explicit
+`torch.__file__` check after an earlier false alarm from this exact
+session's own recurring `sys.modules['torch']` caching gotcha: `import
+torch as real_torch` after a torch-mlx path insert doesn't give you
+real PyTorch, it gives you the already-cached torch-mlx module under a
+different name -- caught and corrected before trusting any of the
+numbers above). The algorithm is right. It's just not faster.
+
+**Root cause, as best determined**: MLX's own GEMM kernel is
+sufficiently well-optimized (structured, coalesced, tiled memory
+access, likely using the GPU's matrix units) that its "wasted" FLOPs on
+mostly-zero matrix entries cost less than a windowed kernel's
+scattered, non-coalesced memory reads (`y[tap_c]` for `tap_c` values
+that jump around per output pixel) — the same shape of finding as this
+project's own "Apple's `mlx.core` GEMM kernel vs its own `torch` MPS
+GEMM kernel" gap for the model's matmuls, just applied to resize
+instead. The complexity-theoretic argument (`O(out×in)` vs `O(out×taps)`)
+is correct on paper and wrong in practice on this hardware, for this
+op, at these sizes.
+
+**Conclusion**: the box-prereduction + dense-matmul approach already
+shipped (Round 403/404) is not a stopgap waiting for a proper fix — it
+already appears to be close to optimal for this hardware. The MPS gap
+at 108MP is not solvable by attacking `F.interpolate`'s resize
+algorithm any further; if it's worth attacking at all, the more likely
+remaining lever is the same one already identified for the model
+forward pass itself (raw `mlx.core` GEMM throughput vs MPS's own GEMM
+throughput), which is not reachable from Python.
 
 ## Was the shim itself the problem? Tested, not assumed: no.
 
