@@ -669,6 +669,41 @@ earlier patchify-via-matmul (<0.15% of total) and custom residual+
 layerscale kernel (<1% of total) findings, both also correctly not
 shipped for the same reason.
 
+## Current state vs real PyTorch MPS, after every fix in this file
+
+The scaling table above (1.02x → 2.15x behind MPS, widening with size)
+was the picture *before* fp16, native preprocessing, and the conv-fold.
+Re-run today with everything in this file applied, `--real-torch-device
+mps`, clean multi-iteration runs:
+
+```
+size            torch-mlx    torch-mlx(c)   torch-mlx(fp16)   PyTorch MPS   fp16 vs MPS
+480x640            654ms          583ms          498ms            750ms       1.51x FASTER
+4000x3000          722ms          665ms          566ms            752ms       1.33x FASTER
+12000x9000        1121ms         1091ms          968ms            754ms       1.28x slower
+```
+
+At normal-to-large photo sizes (≤12MP — the vast majority of real use),
+torch-mlx now clearly **beats** real PyTorch's own MPS backend, by a
+wide enough margin that even plain eager fp32 torch-mlx wins on its own
+(654ms/722ms vs MPS's flat ~750ms) before fp16 adds another ~24-28% on
+top. This is a full reversal of the original "roughly at parity, MPS
+pulling ahead with size" finding.
+
+The 108MP case is the one place MPS still wins, and the gap has
+narrowed from 2.15x to 1.28x — real, substantial progress, not fully
+closed. The remaining gap is exactly the item marked "identified, not
+fixed" in the optimization audit above: `F.interpolate`'s per-axis
+resize is a dense `(out_size, in_size)` matmul, `O(in_size × out_size)`
+regardless of how sparse the true windowed-resize kernel actually is,
+and MPS's own resize doesn't pay that cost. The box-prereduction fix
+(Round 403) blunted this for ≥8x downsample ratios but didn't replace
+the fundamental data structure; a true sparse/windowed reimplementation
+of antialiased resize remains the identified-but-not-attempted fix for
+closing this specific remaining gap (needs its own backward pass
+instead of inheriting one from `matmul` for free -- the same tradeoff
+noted when Round 403 was scoped).
+
 ## Was the shim itself the problem? Tested, not assumed: no.
 
 The obvious next hypothesis after the matmul-throughput finding above:
