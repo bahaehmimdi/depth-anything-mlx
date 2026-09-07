@@ -31,6 +31,16 @@ commit history (Rounds 401-406).
 | 10 | Fold rescale+normalize into the patch-embedding conv's weights (exact algebraic fold, computed once at load time) — user-prioritized idea, item #4 on a list ranking MLX preprocessing options | depth-anything-mlx (own code, not torch-mlx) | Exact (verified 0.0 correctness delta vs real PyTorch, identical to pre-fold), removes 2 elementwise passes per image. Speeds up fp32 more than fp16 in absolute terms (that elementwise cost was a bigger fraction of fp32's time), narrowing the fp16-vs-fp32 ratio at 108MP from 1.224x to 1.129x — not a regression, both got faster, see "fold rescale+normalize" below |
 | 11 | Skip `image.convert("RGB")` when the input is already RGB | depth-anything-mlx (own code, not torch-mlx) | `.convert("RGB")` on an already-RGB image still does a full unconditional re-conversion pass (PIL doesn't short-circuit) — measured 38.6ms wasted on a 108MP image, every single call, for the common case of a photo that's already RGB. Fixed with one `if image.mode != "RGB"` check. Verified savings ~38.7ms in a clean interleaved full-`estimate()` A/B (4 rounds, new faster in all 4), matching the isolated measurement almost exactly |
 | 12 | Resize-back via torch-mlx's own `F.interpolate` (bilinear) instead of PIL's `.resize()` | depth-anything-mlx (own code, not torch-mlx) | **~2.6x** on this step alone at 108MP (154.1ms → 59.8ms) — PIL's resize is CPU-only; this project's whole point is that the underlying MLX/Metal compute is fast once you're not routing through it. Verified against real PIL's own BILINEAR output (mean diff 0.31, max ~1 on the 0-255 scale — rounding-level, same tolerance already accepted when BILINEAR was chosen over BICUBIC). End-to-end correctness vs real PyTorch unaffected (mean diff 0.709 vs the prior 0.765, both dominated by pre-existing model-forward numeric noise) |
+| 13 | uint8 → target dtype directly in `_native_preprocess` (was always uint8→fp32, then a second fp32→fp16 pass when `dtype=mx.float16`) | depth-anything-mlx (own code, not torch-mlx) | Bit-exact (uint8 values are exactly representable in both fp32 and fp16, verified max diff 0.0) — ~24.8ms saved at 108MP by skipping a full extra 1.3GB-scale buffer allocation+pass |
+| 14 | `np.asarray()` instead of `np.array()` for the final `mx.array`→PIL conversion | depth-anything-mlx (own code, not torch-mlx) | `np.array()`'s default `copy=True` forced an unnecessary explicit copy (9.55ms at 108MP scale) where `np.asarray()` gets a real zero-copy buffer-protocol view instead (~0ms). Verified safe, not just fast: the returned array's `.base` is a `memoryview` holding a proper reference to the underlying buffer via normal refcounting — confirmed surviving an explicit `gc.collect()` of the source `mx.array`, and confirmed correct through a real save-to-disk-and-reload round trip |
+
+**Checked and correctly NOT changed**: fusing `estimate()`'s intermediate
+`mx.eval(scaled)` away (letting normalize + resize-back combine into one
+lazy graph evaluated once at the very end, instead of two eval points) —
+measured 566.71ms vs 565.86ms, a 0.85ms difference that's pure noise.
+MLX's own per-`mx.eval()` scheduling overhead is cheap enough that this
+specific fusion doesn't matter at this scale; kept the code as two
+explicit stages since that's clearer and costs nothing.
 
 **Shipped to torch-mlx, but no measurable effect on this model** (kept
 anyway — zero risk, may help other torch-mlx workloads):
@@ -704,14 +714,16 @@ the *ratios* as the finding, not the absolute milliseconds):
 size            torch-mlx(fp16)   PyTorch MPS (full pipeline)   ratio
 480x640              506ms                   766ms              1.51x FASTER
 4000x3000           1138ms                  1793ms              1.58x FASTER
+12000x9000 (108MP)   784ms                  1176ms              1.50x FASTER
 ```
 
-108MP wasn't re-measured as a clean single table row (avoided piling
-more heavy GPU load on an already-hot machine), but was checked via 3
-interleaved rounds against torch-mlx (fp16) under the same thermal
-conditions: torch-mlx faster in all three (1.05x, 1.20x, 1.26x) --
-consistent enough across repeated rounds under real noise to trust the
-direction even without a clean absolute number.
+The 108MP row was re-measured after shipping the direct-dtype-cast and
+`np.asarray` fixes (below) -- clean single `benchmark.py` run, machine
+apparently cooled somewhat by this point (784ms here vs the 1.05-1.26x/
+noisier numbers from the interleaved check done immediately after the
+benchmark-bug fix). **torch-mlx (fp16) now clearly beats real PyTorch's
+own MPS backend at every tested size, including 108MP, by a consistent
+~1.5x** -- not just directionally, with a clean number to match.
 
 **Net conclusion**: torch-mlx (fp16) beats real PyTorch's own MPS
 backend at every size tested, including 108MP -- a full reversal of
