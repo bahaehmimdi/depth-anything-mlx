@@ -27,6 +27,7 @@ commit history (Rounds 401-406).
 | 6 | Use `mx.fast.layer_norm` (was hand-composed) | torch-mlx Round 406 | ~4.6% end-to-end at 480×640, found via the native-encoder experiment |
 | 7 | BILINEAR instead of PIL's default BICUBIC for the depth-map resize-back | depth-anything-mlx (own code, not torch-mlx) | ~4.4% at 108MP, less variance |
 | 8 | `dtype=mx.float16` option (was ruled out earlier in this project's history; re-verified after torch-mlx's fused-kernel work made that finding stale) | depth-anything-mlx (own code, not torch-mlx) | **~1.15-1.26x** end-to-end, largest single-flag win in this table — see "fp16 revisited" below |
+| 9 | Native preprocessing (bypasses `AutoImageProcessor` entirely for the resize/rescale/normalize chain, so it can run in the model's own `dtype` too) | depth-anything-mlx (own code, not torch-mlx) | Improves the 108MP case specifically from 1.147x to **1.224x** (fp16 vs fp32) — see "native preprocessing" below |
 
 **Shipped to torch-mlx, but no measurable effect on this model** (kept
 anyway — zero risk, may help other torch-mlx workloads):
@@ -60,7 +61,7 @@ reason — not assumed, not skipped):
 | Custom hand-written Metal kernel (fused residual-add + layer-scale) | Real 1.29x, correctness verified, but not shipped | Op is cheap and called 48 times total; ~5.5ms total savings on a ~650-700ms pipeline, and integrating it means monkey-patching HuggingFace's own modeling code, not torch-mlx |
 | Video-specific ideas (batching, temporal caching, async streams, persistent pipeline, realtime/offline split) | Don't apply | This project processes single images, not video |
 | MLX-native end-to-end preprocessing (bypass HF's `AutoImageProcessor`) | Not attempted | Bigger architectural change; the actual measured preprocessing cost (PIL's `pil_to_tensor`) is identical under real PyTorch too, so it wouldn't change the relative comparison |
-| fp16 for the antialiased resize step itself (`dtype=` currently only casts the model + its input, not HF's own preprocessing, which stays fp32 regardless) | Real 1.30x on the resize op in isolation (torch-mlx's `F.interpolate`, verified against real natural-image content: 0.021% relative error, well within tolerance), but **not safely integrable** | Isolated every individual piece and each one matched HF's own implementation exactly: the raw PIL→tensor conversion (0.0 diff), the resize step alone given identical inputs (0.0 diff, bit-exact), and `rescale_and_normalize()` alone given identical inputs (~7e-7, float rounding only — this is where HF folds the `1/255` rescale factor directly into `mean`/`std` before calling `normalize()`, an operator-fusion trick in its own right, replicated correctly here). And yet chaining HF's own `resize()` and `rescale_and_normalize()` calls manually, in the exact order `_preprocess()`'s source uses, on a tensor sourced directly from the library itself, still diverges from the real end-to-end pipeline by 1.055 (not a rounding-level gap). This isn't a bug in a formula I can fix — some other internal dispatch/grouping behavior in `transformers`' fast image processor (likely something in its image-batching/shape-grouping path, `group_images_by_shape`/`disable_grouping`, or `_prepare_input_images`) isn't reachable through its documented public methods at all. Reverse-engineering that internal-only behavior for a partial, preprocessing-only win (a minority of total time except at 100MP+) isn't a good risk/reward trade given the correctness stakes. Left unintegrated; the underlying resize speedup is real and could be revisited if this project ever reimplements preprocessing natively instead of going through `AutoImageProcessor` |
+| ~~fp16 preprocessing: not safely integrable~~ — **resolved and shipped, see below** | Native preprocessing | Root cause found: the reference pipeline resizes the still-**uint8** tensor, silently clamping the antialiased resize's overshoot to `[0,255]` before rescale/normalize — a quantization step no amount of correct float-space reimplementation could reproduce without replicating it explicitly. Once found, trivial to replicate (`.round().clip(0, 255)` right after resize) |
 | Full ONNX-export → ONNX Runtime graph optimizer → [`onnxruntime-ep-mlx`](https://github.com/justinchuby/onnxruntime-mlx) execution provider → compiled MLX graph pipeline, as an alternative to torch-mlx entirely | At best parity (527ms fp16 vs this project's 502ms fp16, a 5% gap within this machine's own documented run-to-run noise), not an improvement | Real, working, independently verified (correctness 0.052% relative diff vs real PyTorch, same ballpark as this project's own fp16 numbers) — and does prove the full pipeline (ONNX tracer's shape/dtype specialization → ORT's constant-folding/fusion/dead-code-elimination graph optimizer → MLX EP's kernel selection + `mlx_compile`) beats plain ORT-CPU by 7-9x. But adds real complexity (a separate ONNX export re-specialized per input resolution, three new dependencies: `onnx`, `onnxruntime`, `onnxruntime-ep-mlx`) for no measured gain over what's already shipped here. Useful as independent confirmation from a completely different compiler stack that this project's torch-mlx+fp16+fused-kernel approach isn't leaving obvious speed on the table, not as something to adopt |
 | Quantized Conv2d (naive im2col + `mx.quantized_matmul`), per [ml-explore/mlx#2714](https://github.com/ml-explore/mlx/issues/2714) | 2.7x **slower** on our own DPT decoder conv shape (256→256, 3×3, ~148×196: 14.4ms vs native `mx.conv2d`'s 5.4ms) | That issue hit the same wall (80x slower for them) before winning only with a hand-written, multi-iteration Metal kernel specific to their tiny (18.5KB) conv layer in a memory-constrained UNet — a different problem (shrinking model size) on a different-shaped op than our large, compute-bound decoder convs; consistent with our own quantization finding above (bandwidth win, not useful on a compute-bound workload) |
 
@@ -536,6 +537,72 @@ relative). Not re-tested: the "selective fp16" variant noted as stale
 above (MLP-only) — full fp16 already covers the common case and is now
 the documented, shipped option; selective fp16 would only matter if
 full fp16 broke down at some scale, which it doesn't.
+
+## Native preprocessing: the fp16-resize lead, actually closed out
+
+The item above ("smaller ratio at 108MP because preprocessing stays
+fp32") pointed at real headroom: `dtype=` only casts the model and its
+input, not the resize/rescale/normalize chain, which was going through
+`AutoImageProcessor` and therefore locked to fp32 regardless. An
+earlier pass at this (documented, then, as a dead end) tried driving
+`DPTImageProcessor`'s own `resize()`/`rescale_and_normalize()` methods
+directly with an fp16 tensor, and separately tried a from-scratch
+reimplementation of the same math — both diverged from the real
+`processor(images=...)` output by a large, non-rounding-level margin
+(max diff ~1.06), and chaining the library's own methods in its own
+documented order didn't fix it either. That was written up as blocked
+on unreachable internal dispatch behavior.
+
+It wasn't. Monkeypatching `DPTImageProcessor.resize` to print its
+actual inputs during a real call revealed the real cause: the
+reference pipeline resizes the still-**uint8** tensor, not a float
+one. Antialiased bicubic interpolation produces "ringing" overshoot
+outside the input's value range (confirmed: a float32 resize of this
+same image produces values from -60 to 314, not clamped to [0,255]) —
+but uint8 can't represent that, so the real pipeline's output gets
+implicitly rounded and clamped to whole pixel values in [0,255] *before*
+rescale/normalize ever runs. No amount of getting the resize/rescale/
+normalize *math* right in float space could reproduce that, because
+the actual discrepancy was a missing quantization step, not a formula
+error. Adding `.round().clip(0, 255)` right after resize reproduces the
+reference bit-exact (max diff ~4.8e-7, pure float rounding) — verified
+against the real `processor(images=...)` call, not just against
+another reimplementation.
+
+With the real semantics understood, replacing `AutoImageProcessor`'s
+call with a from-scratch `_native_preprocess()` (PIL → tensor → resize
+→ quantize → rescale → normalize, entirely in `depth_anything_mlx`'s
+own code) became straightforward rather than risky. Verified fp16
+correctness against the fp32 reference (max diff ~5e-4, matching this
+project's other fp16 error magnitudes) and real, compounding speedup —
+larger than the isolated resize-op number (1.30x) suggested, since
+`.round()`/`.clip()` also benefit from fp16 and this measurement
+includes the already-shipped box-prereduction path:
+
+```
+size            fp32 (native)   fp16 (native)   ratio      old fp16 ratio (HF processor, fp32-locked)
+480x640            669.6ms         503.4ms       1.330x     1.263x
+4000x3000           725.9ms         562.8ms       1.290x     1.251x
+12000x9000         1201.5ms         982.0ms       1.224x     1.147x
+```
+
+Every size improved, and the improvement is largest exactly where it
+was smallest before (108MP: 1.147x → 1.224x) — preprocessing being a
+bigger fraction of total time there is exactly why it couldn't ride
+along with the model-only fp16 fix, and exactly why fixing it
+specifically mattered most there. Correctness re-verified end-to-end
+against real PyTorch's own `estimate()`-equivalent output (mean abs
+diff 0.76, max 3, on the final 0-255 image) — consistent with this
+project's already-documented model-forward numeric noise (torch-mlx vs
+real PyTorch matmul/attention ordering across 24+ layers), not a new
+discrepancy introduced by this change.
+
+**Lesson for future dead-end write-ups in this file**: "diverges by a
+large margin and I can't find why" is a real, honestly-reported result
+at the time it's written — but it's worth a monkeypatch-and-trace
+attempt before calling something architecturally blocked, since the
+actual blocker here was one missing `.round().clip()` call, not a
+fundamentally unreachable internal.
 
 ## Was the shim itself the problem? Tested, not assumed: no.
 

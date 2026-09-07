@@ -3,14 +3,21 @@ PyTorch anywhere in the stack.
 
 This does NOT reimplement Depth-Anything-V2's architecture in native
 MLX. It runs the real, unmodified `transformers.AutoModelForDepthEstimation`
-+ `AutoImageProcessor` pipeline (real HF weights, real preprocessing)
-against `torch-mlx` (github.com/bahaehmimdi/torch-mlx) -- a from-scratch
-`torch`-API-compatible layer backed by `mlx.core` instead of PyTorch's
-own ATen/CPU/CUDA backend -- plus a real (but stubbed-at-the-native-
-extension-boundary) `torchvision` from
-github.com/bahaehmimdi/vision, since `AutoImageProcessor` needs its v2
-transforms. See README.md for the full explanation and `vendor/` for
-both dependencies, pinned as git submodules.
+model against `torch-mlx` (github.com/bahaehmimdi/torch-mlx) -- a
+from-scratch `torch`-API-compatible layer backed by `mlx.core` instead
+of PyTorch's own ATen/CPU/CUDA backend -- plus a real (but stubbed-at-
+the-native-extension-boundary) `torchvision` from
+github.com/bahaehmimdi/vision, needed by `transformers` itself even
+though this package's own preprocessing (see `_native_preprocess`
+below) doesn't call into it. Preprocessing (resize/rescale/normalize)
+is reimplemented natively here rather than calling `AutoImageProcessor`
+directly, so it can run in the model's own `dtype` (see BENCHMARK_RESULTS.md's
+"native preprocessing" section for why and the real speedup this gets) --
+`AutoImageProcessor` is still loaded and kept around for its config
+(target size, mean/std, rescale factor), just not for computing
+`pixel_values` itself. See README.md for the full explanation and
+`vendor/` for both torch-mlx/vision dependencies, pinned as git
+submodules.
 
 Usage:
     from depth_anything_mlx import DepthAnythingMLX
@@ -27,6 +34,7 @@ Usage:
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -34,6 +42,84 @@ _HERE = Path(__file__).resolve().parent
 _VENDOR = _HERE.parent / "vendor"
 
 MODEL_ID = "depth-anything/Depth-Anything-V2-Large-hf"
+
+
+def _constrain_to_multiple_of(val: float, multiple: int, min_val: int = 0, max_val: int | None = None) -> int:
+    """Ported from `transformers.models.dpt.image_processing_dpt.
+    get_resize_output_image_size`'s own inner helper -- verified bit-
+    identical against it (see Round "native preprocessing" in
+    BENCHMARK_RESULTS.md)."""
+    x = round(val / multiple) * multiple
+    if max_val is not None and x > max_val:
+        x = math.floor(val / multiple) * multiple
+    if x < min_val:
+        x = math.ceil(val / multiple) * multiple
+    return x
+
+
+def _native_preprocess(image, processor, dtype):
+    """Reimplements `DPTImageProcessor.__call__`'s pixel_values pipeline
+    natively (resize -> rescale -> normalize) instead of calling
+    `processor(images=image, return_tensors="pt")`, so the whole chain
+    can run in `dtype` (e.g. fp16) instead of being locked to fp32.
+
+    This was originally assumed to be blocked: driving the processor's
+    own `resize()`/`rescale_and_normalize()` methods (or a from-scratch
+    reimplementation of the same math) with a float32 or fp16 tensor
+    consistently diverged from the real `processor(images=...)` output
+    by a large, non-rounding-level margin (max diff ~1.06). Traced it
+    by monkeypatching `DPTImageProcessor.resize` to print its actual
+    inputs during a real call: the reference pipeline resizes the
+    still-**uint8** tensor, not a float one -- so the antialiased
+    bicubic interpolation's output gets implicitly rounded and clamped
+    to whole pixel values in [0, 255] (uint8 can't hold the negative/
+    >255 "ringing" overshoot a true float resize produces), losing
+    sub-pixel precision *before* rescale/normalize ever run. Replicating
+    that quantization step (`.round().clip(0, 255)` right after resize,
+    before rescale) reproduces the reference bit-exact (max diff
+    ~4.8e-7, pure float rounding). Verified this holds with `dtype=
+    mx.float16` too (max diff ~5e-4 vs the fp32 reference, matching this
+    project's other fp16 error magnitudes) -- and it's not just
+    "equally correct": doing the resize itself in fp16 is a REAL further
+    speedup (measured ~1.3-1.8x on the resize+quantize step alone,
+    largest at big/108MP-scale images where preprocessing is a bigger
+    fraction of total time), since this bypasses `AutoImageProcessor`
+    entirely rather than casting only the model + its input.
+
+    Scoped to this class's own fixed assumptions (asserted once at
+    __init__ time, not silently ignored): bicubic resample, antialiased,
+    rescale+normalize both enabled, no center-crop/padding. If a
+    different `model_id` uses a processor configured differently, this
+    function is not used at all -- see `DepthAnythingMLX.__init__`."""
+    import mlx.core as mx
+    import torch
+    import torch.nn.functional as F
+    import torchvision.transforms.v2.functional as tvF
+    from torch._tensor import Tensor
+
+    t = tvF.pil_to_tensor(image)
+    t = tvF.to_dtype(t, torch.float32, scale=False).unsqueeze(0)
+    if dtype is not None:
+        t = Tensor(t.data.astype(dtype))
+
+    ih, iw = t.shape[-2], t.shape[-1]
+    oh, ow = processor.size.height, processor.size.width
+    sh, sw = oh / ih, ow / iw
+    if processor.keep_aspect_ratio:
+        if abs(1 - sw) < abs(1 - sh):
+            sh = sw
+        else:
+            sw = sh
+    new_h = _constrain_to_multiple_of(sh * ih, processor.ensure_multiple_of)
+    new_w = _constrain_to_multiple_of(sw * iw, processor.ensure_multiple_of)
+
+    resized = F.interpolate(t, size=(new_h, new_w), mode="bicubic", align_corners=False, antialias=True)
+    quantized = resized.round().clip(0, 255)
+
+    target_dtype = dtype if dtype is not None else mx.float32
+    mean = Tensor(mx.array(processor.image_mean, dtype=target_dtype).reshape(1, 3, 1, 1))
+    std = Tensor(mx.array(processor.image_std, dtype=target_dtype).reshape(1, 3, 1, 1))
+    return (quantized * processor.rescale_factor - mean) / std
 
 
 def _ensure_torch_mlx_active() -> None:
@@ -102,6 +188,14 @@ class DepthAnythingMLX:
         from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
         self.processor = AutoImageProcessor.from_pretrained(model_id)
+        # `_native_preprocess` hardcodes this exact configuration (bicubic
+        # antialiased resize, rescale+normalize, no crop/pad) -- assert it
+        # rather than silently mis-processing images if a different
+        # `model_id` is ever passed with a differently-configured processor.
+        assert self.processor.resample == 3, "native preprocess assumes bicubic resample"
+        assert self.processor.do_rescale and self.processor.do_normalize
+        assert not getattr(self.processor, "do_pad", False)
+        assert not getattr(self.processor, "do_center_crop", False)
         # disable_mmap=True: safetensors' memory-mapped "pt" framework
         # loading path needs torch.UntypedStorage.from_file, which
         # torch-mlx doesn't implement -- this falls back to a loading
@@ -152,21 +246,16 @@ class DepthAnythingMLX:
         from PIL import Image
 
         image = image.convert("RGB")
-        inputs = self.processor(images=image, return_tensors="pt")
-
-        if self.dtype is not None:
-            from torch._tensor import Tensor
-
-            inputs["pixel_values"] = Tensor(inputs["pixel_values"].data.astype(self.dtype))
+        pixel_values = _native_preprocess(image, self.processor, self.dtype)
 
         if self.compiled:
-            raw_out = self._compiled_forward(self._raw_params, inputs["pixel_values"].data)
+            raw_out = self._compiled_forward(self._raw_params, pixel_values.data)
             depth_raw = raw_out[0]
         else:
             import torch
 
             with torch.no_grad():
-                predicted_depth = self.model(**inputs).predicted_depth[0]
+                predicted_depth = self.model(pixel_values=pixel_values).predicted_depth[0]
             depth_raw = predicted_depth.data
 
         depth_min, depth_max = mx.min(depth_raw), mx.max(depth_raw)
