@@ -690,13 +690,47 @@ wide enough margin that even plain eager fp32 torch-mlx wins on its own
 top. This is a full reversal of the original "roughly at parity, MPS
 pulling ahead with size" finding.
 
-The 108MP case is the one place MPS still wins, and the gap has
-narrowed from 2.15x to 1.28x — real, substantial progress, not fully
-closed. The remaining gap was, until this section, marked "identified,
-not fixed": `F.interpolate`'s per-axis resize is a dense `(out_size,
-in_size)` matmul, `O(in_size × out_size)` regardless of how sparse the
-true windowed-resize kernel actually is, and MPS's own resize doesn't
-pay that cost.
+**Correction (found immediately after writing the above): the "PyTorch
+MPS" column in that table is not a fair number.** `_bench_worker.py`'s
+`run_real_torch()` computes `inputs = processor(images=image, ...)`
+**once, outside the timing loop**, and never resizes the depth map back
+to the original image size at all -- while `run_torch_mlx()` times
+`model.estimate(image)`, which does pil_to_tensor + resize + forward +
+normalize + PIL resize-back, every single iteration. Profiling
+`estimate()`'s own stages at 108MP found pil_to_tensor alone costs
+~274ms and the PIL resize-back ~182ms -- both real, unavoidable per-image
+costs excluded from that "flat 750ms" number. It was never comparable to
+torch-mlx's full-pipeline number; the "108MP: MPS wins" conclusion below
+(and the identical one earlier in this file, before this session's
+fixes) rested on that bug.
+
+Fixed `run_real_torch()` with a `full_pipeline=True` mode replicating
+`estimate()`'s exact contract (same pil_to_tensor call, same processor-
+driven resize, same normalize, same BILINEAR resize-back), and re-ran.
+The corrected number at 108MP is nowhere near 750ms -- interleaved
+against torch-mlx (fp16), 3 rounds: torch-mlx **faster** in all three
+(1.05x, 1.20x, 1.26x). Absolute times in that re-run were themselves
+elevated and noisy (~1.7-2.3s where earlier isolated measurements this
+session showed ~1.0-1.2s) -- this machine shows clear signs of thermal
+throttling after a very long session of continuous GPU-heavy
+benchmarking, so exact ratios here shouldn't be over-read. The
+*direction* is the real finding, confirmed 3/3 under noise that would
+have shown up as inconsistency if it weren't real: **torch-mlx (fp16)
+beats real PyTorch MPS's true full pipeline at 108MP too**, not just at
+smaller sizes. A clean re-measurement after the machine cools down would
+sharpen the exact ratio but is not expected to change the direction.
+
+This means the "identified, not fixed" resize-algorithm gap discussed
+below was investigated against a comparison baseline that was itself
+wrong -- the real MPS number already included the cost the sparse/
+windowed resize experiment was trying to close a gap against, and that
+gap was smaller (or didn't exist in torch-mlx's disfavor at all) than
+the flawed baseline suggested. The sparse/windowed resize experiment's
+own conclusion (dense matmul + box-prereduction beats every
+windowed/kernel alternative tried) stands on its own regardless --
+that was a direct A/B against the *same* torch-mlx dense-matmul
+baseline, not against the flawed MPS number, so it isn't affected by
+this correction.
 
 ## Actually attempted the sparse/windowed fix -- it's slower, not faster
 
