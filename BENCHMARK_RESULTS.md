@@ -652,6 +652,23 @@ outcome of the win being dtype-agnostic. Kept unconditionally (not
 gated behind `dtype=`) since it's a zero-cost, exact simplification
 that helps the fp32 default path too.
 
+## #5 checked and ruled out: fuse resize+quantize into one kernel
+
+Next on the user-supplied priority list after #4 (fold normalize into
+the conv, done above) was #5, "fuse resize+normalization into one
+custom kernel." Normalize no longer exists as a separate step at all
+(folded into the conv), so the only remaining fusable pair is
+resize+quantize (the `.round().clip(0, 255)` right after interpolate).
+
+Measured directly at 108MP scale (fp16, the shipped path) before
+building anything: `.round().clip()` adds 0.097ms on top of a 34.5ms
+resize (0.3% overhead) -- about 0.01% of the ~1000ms total pipeline.
+A custom Metal kernel fusing the two would save at most that 0.097ms.
+Not worth building -- same shape of conclusion as this project's
+earlier patchify-via-matmul (<0.15% of total) and custom residual+
+layerscale kernel (<1% of total) findings, both also correctly not
+shipped for the same reason.
+
 ## Was the shim itself the problem? Tested, not assumed: no.
 
 The obvious next hypothesis after the matmul-throughput finding above:
