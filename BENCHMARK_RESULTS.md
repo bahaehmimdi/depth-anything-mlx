@@ -779,28 +779,35 @@ torch-mlx's own.
 
 Fixed with a `full_pipeline=True` mode on `run_real_torch()` (now
 `benchmark.py`'s default) that replicates `estimate()`'s exact contract
-on the real-torch side too. Re-measured with everything in this file
-applied -- fp16, native preprocessing, the conv-fold -- same-day, same
-machine, so at least internally consistent with each other even though
-this machine was running measurably hot by this point in a very long
-session of continuous GPU benchmarking (absolute times here are
-elevated versus earlier isolated measurements in this same file; take
-the *ratios* as the finding, not the absolute milliseconds):
+on the real-torch side too.
+
+**Definitive comparison, all three sizes, one clean session**: earlier
+versions of this table stitched together runs from different points in
+this very long session (some hot, some cooled), each internally
+consistent but not directly comparable to each other. Re-ran all three
+sizes back-to-back after confirming the machine was at its cool-state
+baseline first (a discipline this file had to learn the hard way --
+see the `mx.compile` section's own process note), with every fix in
+this file applied (fp16, native preprocessing, conv-fold, resize-back,
+direct-dtype-cast, `np.asarray`):
 
 ```
-size            torch-mlx(fp16)   PyTorch MPS (full pipeline)   ratio
-480x640              506ms                   766ms              1.51x FASTER
-4000x3000           1138ms                  1793ms              1.58x FASTER
-12000x9000 (108MP)   784ms                  1176ms              1.50x FASTER
+size                  torch-mlx(fp32)  torch-mlx(compiled)  torch-mlx(fp16)  PyTorch MPS  fp16 vs MPS
+480x640                   667.7ms            610.1ms             511.5ms        758.5ms     1.48x FASTER
+4000x3000 (12MP)          708.8ms            651.4ms             553.3ms        810.5ms     1.46x FASTER
+12000x9000 (108MP)        985.5ms            950.3ms             834.4ms       1172.0ms     1.40x FASTER
 ```
 
-The 108MP row was re-measured after shipping the direct-dtype-cast and
-`np.asarray` fixes (below) -- clean single `benchmark.py` run, machine
-apparently cooled somewhat by this point (784ms here vs the 1.05-1.26x/
-noisier numbers from the interleaved check done immediately after the
-benchmark-bug fix). **torch-mlx (fp16) now clearly beats real PyTorch's
-own MPS backend at every tested size, including 108MP, by a consistent
-~1.5x** -- not just directionally, with a clean number to match.
+**torch-mlx (fp16) beats real PyTorch's own MPS backend at every tested
+size by a remarkably consistent ~1.40-1.48x** -- the margin narrows
+only slightly at the largest size, not the collapse-to-a-loss this
+project's very first scaling table showed (1.02x → 2.15x *behind* MPS,
+widening with size, before any of this file's fixes existed). Even
+plain eager fp32 torch-mlx beats MPS at every size on its own (667.7ms/
+708.8ms/985.5ms vs MPS's 758.5ms/810.5ms/1172.0ms) before fp16 adds
+another ~23-24% on top. This is the single table to point to for "how
+fast is this, really" -- one session, one thermal state, all sizes,
+every fix applied.
 
 **Net conclusion**: torch-mlx (fp16) beats real PyTorch's own MPS
 backend at every size tested, including 108MP -- a full reversal of
