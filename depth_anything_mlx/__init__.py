@@ -218,18 +218,22 @@ class DepthAnythingMLX:
         (max abs diff ~3.7e-4 vs eager, only floating-point noise).
 
         The "only ~1.02x, not worth it" verdict recorded earlier in this
-        project's history is now stale, the same way the original fp16
-        verdict was: it predates every fix in BENCHMARK_RESULTS.md's
-        findings log (conv-fold, native preprocessing, MLX-based
-        resize-back). Re-measured after those landed: ~1.05-1.18x,
-        consistent across repeated runs and across two MLX versions
-        (0.31.2, 0.32.2, the latter tested in an isolated venv, not the
-        shared environment) -- a real, if still modest, win now rather
-        than noise. Left `compiled=False` as the default anyway since
-        the win is size/run dependent and the extra `functional_call`
-        wrapping adds real code-path complexity for a single-digit-to-
-        high-teens percentage; opt in when it's been measured to help
-        for your own workload.
+        project's history is now slightly stale, the same way the
+        original fp16 verdict was: it predates every fix in
+        BENCHMARK_RESULTS.md's findings log (conv-fold, native
+        preprocessing, MLX-based resize-back). Re-measured after those
+        landed, on a properly cooled-down machine (a first re-measure
+        under this same very long session's thermal throttling gave an
+        inflated ~1.05-1.18x that didn't hold up once re-checked under
+        stable conditions -- see BENCHMARK_RESULTS.md's own correction of
+        itself for the full story): a modest but real and consistent
+        **~1.03x for fp16, ~1.04-1.05x for fp32** (occasional noise on
+        individual runs), identical across MLX 0.31.2 and 0.32.2 (the
+        latter tested in an isolated venv, not the shared environment).
+        Left `compiled=False` as the default since the win is small and
+        the extra `functional_call` wrapping adds real code-path
+        complexity for a few percent; opt in when it's been measured to
+        help for your own workload.
 
         `dtype`: pass `mlx.core.float16` to run the whole model (weights
         and activations) in fp16 instead of the default fp32. This was

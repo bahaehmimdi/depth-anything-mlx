@@ -565,38 +565,55 @@ predates every fix later in this file (conv-fold, native
 preprocessing, MLX-based resize-back), all of which changed the shape
 of the compiled graph.
 
-Re-measured eager-vs-compiled at 480x640, both dtypes, repeated across
-several rounds:
+Re-measured eager-vs-compiled at 480x640, both dtypes. First pass was
+run while this machine was under the severe thermal throttling
+documented elsewhere in this file (absolute times drifting from ~500ms
+to ~1600ms across runs) and showed an inflated, noisy ~1.05-1.18x.
+**That number was itself unreliable and is corrected here** -- once the
+machine had cooled back down to its normal baseline (confirmed via a
+sanity check: 502.7ms, matching the documented cool-state reference,
+not the 1200-1600ms hot-state range), three clean interleaved rounds on
+each of two MLX versions gave a much tighter, more trustworthy picture:
 
 ```
-                fp32              fp16
-round 1:      1.049-1.185x      1.082-1.228x
-round 2:      1.071-1.105x      1.056-1.086x
+                fp32                    fp16
+mlx 0.31.2:   1.048, 0.973, 1.051     1.028, 1.027, 1.031
+mlx 0.32.2:   1.042, 1.050, 0.894     1.026, 1.034, 1.036
 ```
 
-Consistently **~1.05-1.18x now, not ~1.02x** -- a real, if still
-modest, win, not noise (positive in every single round). The original
-number wasn't wrong, it was measured against a codebase that's since
-been substantially restructured; the earlier reasoning ("matmul/
-attention-dominated, not much for compile's elementwise fusion to
-buy") was correct in general but the specific number it produced
-became stale once the conv-fold removed the separate rescale/normalize
-elementwise pass and native preprocessing changed what's inside vs.
-outside the compiled region.
+fp16 is remarkably consistent within a version (±0.5%) and essentially
+**identical between the two MLX versions** (~1.03x either way) -- no
+real version effect. fp32 is noisier (each version has one outlier: a
+slight regression on 0.31.2's second round, a bigger one on 0.32.2's
+third), consistent with ordinary run-to-run variance rather than a real
+difference between versions or dtypes.
 
-**On the newer MLX release**: also tested `mlx==0.32.2` (current install
-is `0.31.2`) in an isolated venv -- deliberately NOT upgraded in the
-shared environment, since this machine has a documented precedent of an
-MLX upgrade breaking a *different* live service (`ltx2b`'s VAE decode,
-a Metal cross-thread issue between 0.30.6->0.32). Results on 0.32.2 were
-inconsistent (one run beat 0.31.2's fp16 number at 1.228x, a repeat run
-showed compile actually *slower* than eager at 0.974x/0.895x) under
-severe thermal throttling by this point in a very long session (absolute
-times drifted from ~500ms to ~1600ms across these runs on the *same*
-code). No reliable evidence either way that 0.32.2 changes compile's
-behavior -- and no reason to take on the upgrade's known risk for an
-unproven, possibly-negative effect. Recommendation: stay on 0.31.2;
-the real, confirmed win here didn't need a version change to get.
+**Corrected verdict**: `mx.compile` gives a modest, real, positive
+effect -- **~1.03x for fp16, ~1.04-1.05x for fp32 (with occasional
+noise)** -- bigger than the original stale "~1.02x" but smaller than
+this section first reported before the thermal-noise correction above.
+The original "matmul/attention-dominated, not much for compile's
+elementwise fusion to buy" reasoning holds; the conv-fold and native
+preprocessing changes did shift the number somewhat, just less
+dramatically than the hot-state measurement suggested.
+
+**On the newer MLX release**: also tested `mlx==0.32.2` (current
+install is `0.31.2`) in an isolated venv -- deliberately not upgraded
+in the shared environment, since this machine has a documented
+precedent of an MLX upgrade breaking a *different* live service
+(`ltx2b`'s VAE decode, a Metal cross-thread issue between 0.30.6->0.32).
+Under clean, cool-machine conditions, 0.32.2 shows no meaningful
+difference from 0.31.2 for this model. No reason to take on the
+upgrade's known risk for an unproven effect. Recommendation: stay on
+0.31.2.
+
+**Process note, since this section corrected itself mid-file**:
+absolute-timing benchmarks on this machine are only trustworthy after
+confirming a quick cool-state sanity check first (compare one number
+against a known-good baseline) -- this session hit real, double-to-
+triple inflation from thermal throttling more than once, and the fix
+each time was the same: re-measure after confirming the machine's
+actually back to baseline, don't trust a single hot-state run.
 
 ## Native preprocessing: the fp16-resize lead, actually closed out
 
